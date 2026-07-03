@@ -1,0 +1,46 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.env
+*.log
+logs/
+.DS_Store
+Thumbs.db
+
+# Local harness + workspace artifacts (do not track)
+.claude/settings.local.json
+agent_workspace/
+koda_*.svg
+koda_new_banner.svg
+koda_sidebar_*.svg
+koda_test_screenshot.svg
+koda_with_delete.svg
+
+# Session + model caches
+.koda/
+~/.koda/
+
+# Local-only databases / runtime state — never commit
+*.db
+*.sqlite
+*.sqlite3
+chronos.db
+
+# One-off downloads / demo scratch — not part of the codebase
+get-pip.py
+take_screenshot.py
+index.html
+script.js
+style.css
+
+# Editor
+.idea/
+.vscode/
