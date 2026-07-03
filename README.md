@@ -141,6 +141,22 @@ to watch each one: a stable status line (what it's doing, tokens, tools, elapsed
 seconds) over a **scrollable activity log** of every step it took. `←` opens an
 agent, `→` closes, `↑/↓` scroll.
 
+```mermaid
+sequenceDiagram
+    actor U as You
+    participant A as Main agent
+    participant S1 as subagent · auth
+    participant S2 as subagent · billing
+    U->>A: build an end-to-end SaaS
+    A->>A: plan the workstreams
+    A->>S1: start_async_task(auth)
+    A->>S2: start_async_task(billing)
+    Note over A: main agent stays free — you keep chatting
+    S1-->>A: done ✓
+    S2-->>A: done ✓
+    A->>U: notifies you as each finishes
+```
+
 ### Skills
 
 Skills are reusable, model‑authored playbooks stored under `coding_agent/skills/`
@@ -157,20 +173,25 @@ deepagents' skills middleware surfaces each skill's name + description to the ag
 
 ## Architecture
 
-```
-coding_agent/     The agent — deepagents/LangGraph factory, tools, prompts, skills, subagents
-  agent.py        create_deep_agent wiring (checkpointer, memory, skills, HITL, subagents)
-  backend.py      Composite backend: project cwd + /memories/ + /skills/ mounts
-  tools.py        Extra @tool registry (todos, subagents, …)
-koda/             The terminal backend / bridge
-  __main__.py     CLI entry point + flags (--model, --resume/-r, --continue/-c, --prompt)
-  bridge.py       NDJSON/stdio backend that drives the inline UI
-  adapters/       Pluggable agent backends (coding_agent, deep, raw LangGraph, HTTP/SSE)
-  session_store.py Branchable JSONL sessions, shared across UIs
-  subagent_tasks.py Background async-subagent registry (dashboard)
-koda-ink/         The inline UI — TypeScript + Ink (the interactive frontend)
-examples/         Bring-your-own-agent examples (LangGraph, FastAPI/SSE, planner/executor)
-tests/            pytest (bridge, sessions, subagent tasks)
+```mermaid
+flowchart LR
+    U["👤 You · terminal"]
+    UI["koda-ink<br/>inline Ink UI · Node"]
+    BR["koda.bridge<br/>NDJSON / stdio backend"]
+    AD["Adapter<br/>coding_agent · deep · LangGraph · HTTP"]
+    AG["coding_agent<br/>deepagents · LangGraph loop"]
+    T["Tools<br/>fs · shell · web · MCP"]
+    S["Subagents<br/>task (blocking) · async → /dashboard"]
+    M["Model<br/>Anthropic · OpenAI · Google · Ollama"]
+    P["Persistence<br/>SQLite checkpoints · JSONL sessions"]
+
+    U <--> UI
+    UI <-->|events| BR
+    BR --> AD --> AG
+    AG --> T
+    AG --> S
+    AG --> M
+    AG --> P
 ```
 
 The interactive frontend is the inline Ink UI; `koda/__main__.py` launches it and
@@ -180,6 +201,26 @@ in‑process and needs no Node.
 
 **Bring your own agent:** any compiled LangGraph graph or custom class can be
 attached — see `examples/` and `koda/adapters/`.
+
+<details>
+<summary><b>Project layout</b></summary>
+
+```text
+coding_agent/         The agent — deepagents/LangGraph factory, tools, prompts, skills, subagents
+  agent.py            create_deep_agent wiring (checkpointer, memory, skills, HITL, subagents)
+  backend.py          Composite backend: project cwd + /memories/ + /skills/ mounts
+  tools.py            Extra @tool registry (todos, subagents, …)
+koda/                 Terminal backend / bridge
+  __main__.py         CLI entry + flags (--model, --resume/-r, --continue/-c, --prompt)
+  bridge.py           NDJSON/stdio backend that drives the inline UI
+  adapters/           Pluggable agent backends (coding_agent, deep, LangGraph, HTTP/SSE)
+  session_store.py    Branchable JSONL sessions, shared across UIs
+  subagent_tasks.py   Background async-subagent registry (dashboard)
+koda-ink/             Inline UI — TypeScript + Ink (the interactive frontend)
+examples/             Bring-your-own-agent examples (LangGraph, FastAPI/SSE, planner/executor)
+tests/                pytest (bridge, sessions, subagent tasks)
+```
+</details>
 
 ---
 
