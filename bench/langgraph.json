@@ -1,0 +1,9 @@
+{
+  "graphs": {
+    "koda": "./graph.py:make_graph"
+  },
+  "source": {
+    "kind": "uv",
+    "root": "."
+  }
+}

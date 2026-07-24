@@ -44,3 +44,9 @@ style.css
 # Editor
 .idea/
 .vscode/
+
+# Benchmark job output — one directory per trial, with staged project copies
+# and container logs. Large, regenerable, and machine-specific.
+bench/jobs/
+# Staged harness variant — written per-run by bench/rci/loop.py.
+bench/variant.json

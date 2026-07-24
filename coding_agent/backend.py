@@ -17,11 +17,19 @@ Splits filesystem responsibilities across three storage strategies via
 
 - ``/skills/`` → ``FilesystemBackend`` rooted at ``coding_agent/skills/``
   (package-bundled). Read-mostly skill definitions ship with the agent
-  and are available in every project; the agent reaches them via
-  ``skills=['/skills/']`` on the deepagents factory.
+  and are available in every project.
 
-All three routes are project-scoped *except* ``/skills/``, which is
-intentionally global so skills are reusable across projects.
+- ``/project_skills/`` → ``FilesystemBackend`` rooted at
+  ``<cwd>/.koda/skills/``. Skills that belong to *this* project only.
+
+Both skill routes are handed to the deepagents factory as
+``skills=['/skills/', '/project_skills/']``. Order is load-bearing:
+``SkillsMiddleware`` merges sources left-to-right with **last-wins** on a
+name collision, so a project skill transparently overrides a bundled one of
+the same name.
+
+Every route is project-scoped *except* ``/skills/``, which is intentionally
+global so bundled skills are reusable across projects.
 
 Permission gating is **not** done here. Mutating tools (``write_file`` /
 ``edit_file`` / ``multi_edit`` / ``execute``) are gated by LangGraph's
@@ -171,20 +179,39 @@ def project_memories_dir(root: Path) -> Path:
     return root / ".koda" / "memories"
 
 
+def project_skills_dir(root: Path) -> Path:
+    """Where ``/project_skills/*`` lives on disk for the given project.
+
+    Project-local skills override the package-bundled ones by name — see
+    ``skills=`` in ``coding_agent/agent.py``.
+    """
+    return root / ".koda" / "skills"
+
+
 def build_backend(
     root: Path,
     *,
     timeout: int = 180,
     inherit_env: bool = True,
+    virtual_mode: bool = True,
 ) -> BackendProtocol:
     """Construct the composite backend for the coding agent.
 
     Args:
         root: Project working directory. The default backend's
-            ``root_dir`` and the ``<root>/.koda/memories/`` mount point
-            both anchor here.
+            ``root_dir`` and the ``<root>/.koda/{memories,skills}/`` mount
+            points all anchor here.
         timeout: Shell-command timeout (seconds) for ``LocalShellBackend``.
         inherit_env: Whether subshells inherit the parent process env.
+        virtual_mode: Jail the *file* tools to ``root`` by treating it as a
+            virtual filesystem root — a model-supplied ``/etc/hosts`` lands at
+            ``<root>/etc/hosts``. The right default for a coding agent pointed
+            at a user's project. Set ``False`` when the agent legitimately owns
+            the whole filesystem (benchmark containers, where tasks touch
+            ``/etc``, ``/usr/local``, and ``/app`` by absolute path); ``root``
+            then only anchors *relative* path resolution. Note this has never
+            been a security boundary — ``execute`` runs unrestricted shell
+            either way (see ``LocalShellBackend`` docs).
 
     Returns:
         A ``CompositeBackend`` that the caller passes to
@@ -194,20 +221,30 @@ def build_backend(
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     memories_dir = project_memories_dir(root)
     memories_dir.mkdir(parents=True, exist_ok=True)
+    # Not required for correctness — deepagents' ``FilesystemBackend.ls``
+    # returns empty for a missing dir, so ``SkillsMiddleware`` just finds no
+    # project skills. Created so the agent (and ``/skill new``) has somewhere
+    # to write one.
+    skills_dir = project_skills_dir(root)
+    skills_dir.mkdir(parents=True, exist_ok=True)
 
     default = ReapingShellBackend(
         root_dir=root,
-        virtual_mode=True,
+        virtual_mode=virtual_mode,
         timeout=timeout,
         inherit_env=inherit_env,
     )
     memories = FilesystemBackend(root_dir=memories_dir, virtual_mode=True)
     skills = FilesystemBackend(root_dir=SKILLS_DIR, virtual_mode=True)
+    project_skills = FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
 
+    # ``CompositeBackend`` matches longest-prefix-first, and neither skills
+    # route is a prefix of the other, so the two never shadow one another.
     return CompositeBackend(
         default=default,
         routes={
             "/memories/": memories,
             "/skills/": skills,
+            "/project_skills/": project_skills,
         },
     )

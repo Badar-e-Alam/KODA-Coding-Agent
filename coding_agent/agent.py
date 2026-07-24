@@ -24,6 +24,7 @@ from coding_agent.compaction import (
     build_manual_compaction_engine,
 )
 from coding_agent.model import resolve_model
+from coding_agent.nudges import build_serial_read_nudge_middleware
 from coding_agent.subagents import SUBAGENTS
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
 from coding_agent.mcp import load_mcp_tools
@@ -31,6 +32,19 @@ from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
 
 from koda.tools import permissions as _perms
+
+# ── The agent's declarative context surface ────────────────────────────
+# Exported so the TUI banner (koda/workspace.py) reports what the agent
+# actually loads instead of maintaining its own drifting copy.
+
+# Backend routes handed to ``create_deep_agent(skills=…)``. Order is
+# load-bearing: deepagents' SkillsMiddleware merges sources left-to-right
+# with last-wins on a name collision, so /project_skills/ overrides /skills/.
+SKILL_SOURCES: list[str] = ["/skills/", "/project_skills/"]
+
+# Files auto-injected under <agent_memory> every turn via
+# ``create_deep_agent(memory=…)``. Missing files are silently skipped.
+MEMORY_FILES: list[str] = ["/AGENTS.md", "/user_preferences.md"]
 
 
 def _render_system_prompt(root: Path) -> str:
@@ -140,6 +154,9 @@ async def build_agent(
     cwd: str | Path | None = None,
     timeout: int = 180,
     inherit_env: bool = True,
+    virtual_mode: bool = True,
+    interrupt_on: dict[str, dict] | None = None,
+    system_prompt: str | None = None,
 ) -> CompiledStateGraph:
     """Construct the coding agent.
 
@@ -159,6 +176,18 @@ async def build_agent(
         inherit_env: Pass through the parent process env to subshells.
             Needed for PATH/API keys to be visible to commands the agent
             runs.
+        virtual_mode: Keep the file tools jailed to `cwd` (the default, right
+            for a user's project). `False` lets them address the real
+            filesystem — see `build_backend` — which benchmark harnesses need.
+        interrupt_on: Which tools pause the graph for human approval. Defaults
+            to KODA's policy (``permissions.INTERRUPT_ON``). Pass ``{}`` to
+            gate nothing, for unattended runs where no one can answer the
+            prompt — otherwise the graph halts at the first mutating tool and
+            ``ainvoke`` returns a half-finished state carrying ``__interrupt__``.
+        system_prompt: Fully-rendered system prompt, replacing the default
+            ``SYSTEM_PROMPT_V2`` template. Callers passing this own the
+            substitution of every template field. Used by the harness-tuning
+            loop (``bench/rci/``) to A/B prompt variants against Terminal-Bench.
     """
     try:
         from dotenv import load_dotenv
@@ -168,7 +197,9 @@ async def build_agent(
         pass
 
     root = Path(cwd) if cwd else Path.cwd()
-    backend = build_backend(root, timeout=timeout, inherit_env=inherit_env)
+    backend = build_backend(
+        root, timeout=timeout, inherit_env=inherit_env, virtual_mode=virtual_mode
+    )
     checkpointer = _build_checkpointer(root)
     resolved_model = resolve_model(model)
 
@@ -184,6 +215,14 @@ async def build_agent(
     context_editing = build_context_editing_middleware()
     if context_editing is not None:
         extra_middleware.append(context_editing)
+
+    # Behavioral nudge: inject a batching reminder into the live context after a
+    # streak of single-file read turns. Prompt-only guidance to batch reads was
+    # ignored ~85% of the time in Langfuse traces, so we correct in-context at
+    # the moment of the mistake. Off via KODA_DISABLE_NUDGES. See nudges.py.
+    serial_read_nudge = build_serial_read_nudge_middleware()
+    if serial_read_nudge is not None:
+        extra_middleware.append(serial_read_nudge)
 
     # MCP tools — loaded from .mcp.json (Context7 for up-to-date library
     # docs, etc.) via langchain-mcp-adapters. Non-fatal: returns [] when
@@ -218,13 +257,17 @@ async def build_agent(
         # `write_todos`, `task`) plus any MCP tools loaded above.
         # See coding_agent/tools.py and coding_agent/mcp.py.
         tools=all_tools,
-        # Skill files live under the FilesystemBackend mounted at /skills/
-        # inside the composite backend (see coding_agent/backend.py).
-        skills=["/skills/"],
+        # Skill files live under the two FilesystemBackends mounted at
+        # /skills/ (package-bundled, global) and /project_skills/
+        # (<cwd>/.koda/skills, this project only) — see coding_agent/backend.py.
+        # ORDER IS LOAD-BEARING: SkillsMiddleware merges sources left-to-right
+        # with last-wins on a name collision, so a project skill overrides a
+        # bundled one of the same name.
+        skills=SKILL_SOURCES,
         # System prompt is rendered per-session with current_date / cwd /
         # bootstrap_required substituted in. See _render_system_prompt
         # and coding_agent/system_prompt_v2.py for the template.
-        system_prompt=_render_system_prompt(root),
+        system_prompt=_render_system_prompt(root) if system_prompt is None else system_prompt,
         # Durable context auto-injected under <agent_memory> every turn:
         # AGENTS.md (the knowledge-base hub/index) and user_preferences.md
         # (small, globally relevant). deepagents' MemoryMiddleware silently
@@ -235,7 +278,7 @@ async def build_agent(
         # demand via the links in AGENTS.md. The agent creates any of these
         # files only when it has durable info to record; see the
         # <Project knowledge base> block in coding_agent/system_prompt_v2.py.
-        memory=["/AGENTS.md", "/user_preferences.md"],
+        memory=MEMORY_FILES,
         # Persist graph state to disk so conversations survive restarts.
         # Caller must pass ``configurable.thread_id`` on invoke/stream;
         # ``run()`` below derives one from cwd via ``_thread_id_for``.
@@ -249,7 +292,7 @@ async def build_agent(
         # ``Command(resume=…)`` once the user decides. The gated-tool set
         # and the approve/reject/ask policy both live in
         # ``koda/tools/permissions.py`` so they stay in one place.
-        interrupt_on=_perms.INTERRUPT_ON,
+        interrupt_on=_perms.INTERRUPT_ON if interrupt_on is None else interrupt_on,
         # Specialist subagents (explore / plan / edit) the main agent
         # dispatches via the built-in ``task`` tool, plus any configured
         # REMOTE async subagents (identified by their ``graph_id`` field and
@@ -263,6 +306,13 @@ async def build_agent(
     # without an explicit ``await conn.close()`` it pins the process
     # open after Textual unmounts (terminal appears to hang).
     graph._koda_checkpointer_conn = checkpointer.conn  # type: ignore[attr-defined]
+    # Stash which tools came from MCP servers. The TUI tags each tool's origin
+    # in the workspace banner; it used to infer "not in a hardcoded builtin
+    # list ⇒ MCP", which quietly mislabels every tool deepagents renames. This
+    # is the authoritative answer, so no list needs to be kept in sync.
+    graph._koda_mcp_tool_names = frozenset(  # type: ignore[attr-defined]
+        str(getattr(t, "name", "")) for t in mcp_tools
+    )
     # Stash the summarization engine the ``/compact`` command drives on
     # demand (see coding_agent/compaction.compact_thread).
     graph._koda_compact_engine = build_manual_compaction_engine(  # type: ignore[attr-defined]
