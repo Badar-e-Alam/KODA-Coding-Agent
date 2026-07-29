@@ -12,15 +12,18 @@ reusable plumbing (cancel, usage, error handling, final Done) lives in
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import uuid
-from typing import Any, AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable
+from typing import Any
 
 from langgraph.types import Command
 
 from koda.adapters.base import (
     BaseAdapter,
+    _extract_agent_event,
     model_supports_thinking,
     model_supports_vision,
     tools_from_objects,
@@ -28,6 +31,9 @@ from koda.adapters.base import (
 from koda.agent_api import (
     AgentDescription,
     AgentEvent,
+    LLMResponse,
+    NodeEntered,
+    NodeExited,
     PermissionItem,
     PermissionRequest,
     TextDelta,
@@ -51,6 +57,10 @@ _DEFAULT_RECURSION_LIMIT = int(os.environ.get("KODA_RECURSION_LIMIT", "1000"))
 # (which all start with ``event.get("event") != …``) skip it cleanly.
 _PERM_KEY = "__koda_permission__"
 
+# Markers for graph-trace events emitted by ``_native_stream``.
+_NODE_START_KEY = "__koda_node_start__"
+_NODE_END_KEY = "__koda_node_end__"
+
 
 class LangGraphAdapter(BaseAdapter):
     """Wrap a compiled LangGraph graph as a KodaAgent."""
@@ -71,12 +81,17 @@ class LangGraphAdapter(BaseAdapter):
         self._pending_decision_future: asyncio.Future | None = None
         # Bind per-instance so subclasses (or tests) can swap them out.
         self._extractors = (
+            _extract_agent_event,
             _extract_permission,
+            _extract_node_start,
+            _extract_node_end,
             _extract_chat_stream,
             _extract_chat_model_end,
+            _extract_llm_response,
             _extract_tool_start,
             _extract_tool_end,
         )
+
 
     def mark_seeded(self) -> None:
         """Declare that the upstream graph already has this thread's history.
@@ -170,6 +185,8 @@ class LangGraphAdapter(BaseAdapter):
                 # for the race to be re-armed. Belt and suspenders.
                 if self._cancel.is_set():
                     return
+                for marker in _emit_node_lifecycle(event):
+                    yield marker
                 yield event
 
             if self._cancel.is_set():
@@ -214,7 +231,7 @@ class LangGraphAdapter(BaseAdapter):
                 if answers is None:  # cancelled / abandoned
                     return
                 slots_by_id = dict(per_interrupt)
-                for (iid, slot_idx, _item), answer in zip(human, answers):
+                for (iid, slot_idx, _item), answer in zip(human, answers, strict=True):
                     slots_by_id[iid][slot_idx] = answer
 
             # Every slot must be filled (one decision per gated tool call) or
@@ -278,6 +295,59 @@ def _extract_permission(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
     if items is None:
         return None
     return (PermissionRequest(items=list(items)),)
+
+
+def _emit_node_lifecycle(event: dict[str, Any]) -> Iterable[Any]:
+    """Yield graph-trace markers before the raw LangGraph event.
+
+    Emits ``NodeEntered``/``NodeExited`` for chains, tools, and chat model
+    calls so the web UI can render a graph trace.
+    """
+    name = event.get("name") or "unknown"
+    kind = event.get("event")
+    data = event.get("data") or {}
+
+    if kind in ("on_chain_start", "on_tool_start", "on_chat_model_start"):
+        yield {_NODE_START_KEY: {"node": name, "input": _sanitize_json(data.get("input", {}))}}
+    elif kind in ("on_chain_end", "on_tool_end", "on_chat_model_end"):
+        output = data.get("output")
+        if output is None:
+            output = {}
+        yield {_NODE_END_KEY: {"node": name, "output": _sanitize_json(output)}}
+
+
+def _sanitize_json(value: Any) -> Any:
+    """Make an arbitrary value JSON-serializable using ``default=str``."""
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return {}
+
+
+def _extract_node_start(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
+    marker = event.get(_NODE_START_KEY)
+    if marker is None:
+        return None
+    return (NodeEntered(node=marker["node"], input=marker.get("input") or {}),)
+
+
+def _extract_node_end(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
+    marker = event.get(_NODE_END_KEY)
+    if marker is None:
+        return None
+    return (NodeExited(node=marker["node"], output=marker.get("output") or {}),)
+
+
+def _extract_llm_response(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
+    if event.get("event") != "on_chat_model_end":
+        return None
+    output = (event.get("data") or {}).get("output")
+    if output is None:
+        return None
+    content = getattr(output, "content", "")
+    if not isinstance(content, str):
+        content = str(content)
+    return (LLMResponse(content=content),)
 
 
 def _extract_chat_stream(event: dict[str, Any]) -> Iterable[AgentEvent] | None:

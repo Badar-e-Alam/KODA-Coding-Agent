@@ -10,8 +10,9 @@ stream. See `koda/adapters/` for reference implementations.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol, Union, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,53 @@ class Done:
 
 
 @dataclass
+class NodeEntered:
+    """A graph/tool/chain node started execution."""
+
+    node: str
+    input: dict[str, Any]
+
+
+@dataclass
+class NodeExited:
+    """A graph/tool/chain node finished execution."""
+
+    node: str
+    output: dict[str, Any]
+
+
+@dataclass
+class LLMRequest:
+    """An LLM call began."""
+
+    prompt: str | list[Any]
+    model: str
+
+
+@dataclass
+class LLMToken:
+    """One incremental token (or chunk) from an LLM stream."""
+
+    content: str
+
+
+@dataclass
+class LLMResponse:
+    """The final assembled response from an LLM call."""
+
+    content: str
+
+
+@dataclass
+class CostUpdated:
+    """Running cost estimate updated after a usage observation."""
+
+    cost_usd: float
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
 class PermissionItem:
     """A single tool call awaiting the user's approval.
 
@@ -119,9 +167,21 @@ class PermissionRequest:
     items: list[PermissionItem]
 
 
-AgentEvent = Union[
-    TextDelta, ThinkingDelta, ToolStart, ToolResult, Usage, Done, PermissionRequest
-]
+AgentEvent = (
+    TextDelta
+    | ThinkingDelta
+    | ToolStart
+    | ToolResult
+    | Usage
+    | Done
+    | NodeEntered
+    | NodeExited
+    | LLMRequest
+    | LLMToken
+    | LLMResponse
+    | CostUpdated
+    | PermissionRequest
+)
 
 
 @runtime_checkable
@@ -162,7 +222,7 @@ class KodaAgent(Protocol):
     # :func:`describe_agent` which handles the absent / failing cases.
 
 
-def describe_agent(agent: "KodaAgent") -> AgentDescription:
+def describe_agent(agent: KodaAgent) -> AgentDescription:
     """Safely call ``agent.describe()`` with a minimal fallback.
 
     Adapters predating the ``describe`` extension — or implementations

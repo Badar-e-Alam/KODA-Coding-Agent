@@ -24,15 +24,19 @@ That's it. A new SDK adapter is usually 40-80 lines.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
-from typing import Any, AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from typing import Any, get_args
 
 from koda.agent_api import (
     AgentDescription,
     AgentEvent,
+    CostUpdated,
     Done,
     KodaAgent,
+    LLMRequest,
     ToolDescription,
     ToolResult,
     Usage,
@@ -62,12 +66,62 @@ def _has_usage(u: Usage) -> bool:
     return any((u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens))
 
 
+# Heuristic per-token rates.  Live pricing is intentionally not fetched.
+_INPUT_RATE_PER_TOKEN: dict[tuple[str, ...], float] = {
+    ("anthropic", "claude"): 3.0 / 1_000_000,
+    ("openai", "gpt", "o1", "o3"): 0.5 / 1_000_000,
+}
+_OUTPUT_RATE_PER_TOKEN: dict[tuple[str, ...], float] = {
+    ("anthropic", "claude"): 15.0 / 1_000_000,
+    ("openai", "gpt", "o1", "o3"): 1.5 / 1_000_000,
+}
+
+
+def _rate_for(model: str, table: dict[tuple[str, ...], float]) -> float:
+    low = (model or "").lower()
+    for keys, rate in table.items():
+        if any(k in low for k in keys):
+            return rate
+    return 0.0
+
+
+def estimate_usage_cost(model: str, usage: Usage) -> float:
+    """Return a heuristic USD cost for the given usage under ``model``.
+
+    Rates are hard-coded fallbacks:
+      * Anthropic/Claude family: $3/M input, $15/M output tokens.
+      * OpenAI/GPT/o family: $0.5/M input, $1.5/M output tokens.
+      * Local/unknown: $0.
+    """
+    input_rate = _rate_for(model, _INPUT_RATE_PER_TOKEN)
+    output_rate = _rate_for(model, _OUTPUT_RATE_PER_TOKEN)
+    return (
+        usage.input_tokens * input_rate
+        + usage.output_tokens * output_rate
+        + usage.cache_read_tokens * input_rate
+        + usage.cache_write_tokens * input_rate
+    )
+
+
+def _extract_agent_event(chunk: Any) -> Iterable[AgentEvent] | None:
+    """Pass-through extractor for native streams that yield KODA events directly.
+
+    Some adapters (e.g. LangGraph) emit typed :class:`AgentEvent` objects
+    interleaved with raw SDK chunks.  This extractor lets the shared loop
+    forward them without each subclass reinventing the passthrough.
+    """
+    if isinstance(chunk, tuple(get_args(AgentEvent))):
+        return (chunk,)
+    return None
+
+
 class BaseAdapter(KodaAgent):
     """Reusable KodaAgent implementation driven by a native stream +
     a tuple of per-chunk extractors."""
 
     # Subclass hook — override with a tuple of Extractor callables.
-    _extractors: Sequence[Extractor] = ()
+    # The default pass-through lets subclasses yield AgentEvents directly.
+    _extractors: Sequence[Extractor] = (_extract_agent_event,)
 
     # Subclasses set this to surface their backend in ``describe()``.
     # Kept as a class attribute so the default ``describe`` works without
@@ -130,6 +184,12 @@ class BaseAdapter(KodaAgent):
         """
         self._cancel.clear()
         usage = Usage()
+        running_cost = 0.0
+        last_usage = Usage()
+
+        # Surface the start of the LLM turn so the web UI can render the
+        # request lifecycle even before the first token arrives.
+        yield LLMRequest(prompt=message, model=self._model)
 
         stream_iter = self._native_stream(message, history).__aiter__()
         try:
@@ -160,10 +220,8 @@ class BaseAdapter(KodaAgent):
                     next_task.cancel()
                     aclose = getattr(stream_iter, "aclose", None)
                     if aclose is not None:
-                        try:
+                        with contextlib.suppress(Exception):
                             await aclose()
-                        except Exception:
-                            pass
                     break
 
                 # Native stream produced a chunk (or raised).
@@ -183,6 +241,19 @@ class BaseAdapter(KodaAgent):
                     for ev in produced:
                         if isinstance(ev, Usage):
                             merge_usage(usage, ev)
+                            cost = estimate_usage_cost(self._model, usage)
+                            usage_changed = any(
+                                getattr(usage, a) != getattr(last_usage, a)
+                                for a in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+                            )
+                            if usage_changed:
+                                last_usage = Usage(**usage.__dict__)
+                                running_cost = cost
+                                yield CostUpdated(
+                                    cost_usd=running_cost,
+                                    input_tokens=usage.input_tokens,
+                                    output_tokens=usage.output_tokens,
+                                )
                         yield ev
         except asyncio.CancelledError:
             _log.info("%s stream cancelled", type(self).__name__)
@@ -260,6 +331,8 @@ __all__ = [
     "BaseAdapter",
     "Extractor",
     "merge_usage",
+    "estimate_usage_cost",
+    "_extract_agent_event",
     "model_supports_thinking",
     "model_supports_vision",
     "tools_from_objects",

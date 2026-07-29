@@ -28,6 +28,25 @@ When no registry is bound (Textual TUI, headless one-shot mode), the tools
 degrade to a clear "unavailable" message instead of failing. The registry lives
 on the asyncio loop; these ``@tool`` functions run in a worker thread under
 LangGraph, so they hop onto the loop with ``run_coroutine_threadsafe``.
+
+NOT A DUPLICATE — DO NOT DELETE IN FAVOUR OF THE DEEPAGENTS MIDDLEWARE.
+This module deliberately shadows deepagents' tool names, which makes it look
+like exactly the kind of hand-rolled copy worth deleting. It isn't:
+
+  * ``AsyncSubAgentMiddleware`` is *remote-only*. It builds a ``langgraph_sdk``
+    client and POSTs runs to an Agent Protocol server; there is no in-process
+    mode. Switching to it would mean background subagents stop working unless
+    the user is running a LangGraph server.
+  * It is also a smaller surface. ``BackgroundTaskRegistry`` additionally does
+    ``stop`` / ``resume`` / ``restart`` / ``answer_permission``, which is what
+    powers the TUI's ``/tasks`` command, the live TaskBar, ``task_update``
+    events, and per-task permission prompts. The remote middleware offers no
+    equivalent.
+
+The two are already mutually exclusive by name (see ``_load_async_subagents``
+in ``coding_agent/agent.py``), so both can coexist: configure
+``.koda/async_subagents.json`` to get the official remote transport, or leave it
+absent to get these local ones.
 """
 
 from __future__ import annotations

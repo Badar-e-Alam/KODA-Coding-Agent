@@ -7,7 +7,7 @@ Launch from the repo root:
 File layout
 -----------
   prompt.py       system prompt template + environment stamp
-  tools.py        web_search, read_webpage, show_widget
+  tools.py        show_widget, write_report_pdf (+ web tools from coding_agent)
   skills.py       scans <workspace>/skills/* for local SKILL.md bundles
   deep_agent.py   wires everything into `create_deep_agent`
 

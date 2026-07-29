@@ -1,102 +1,26 @@
 """Custom tools for KODA's deep agent.
 
 Only the non-default tools live here. Filesystem + `execute` are provided by
-deepagents' `FilesystemBackend`, so we do not re-declare them.
+deepagents' `FilesystemBackend`, so we do not re-declare them. The web tools
+are imported from `coding_agent.tools` rather than reimplemented — KODA used to
+carry four copies of `web_search`.
 
-  * web_search       — Jina search API
-  * read_webpage     — Jina reader API (url -> markdown)
+  * web_search       — Tavily search      (from coding_agent.tools)
+  * web_fetch        — url -> page text   (from coding_agent.tools)
   * show_widget      — render a mermaid diagram to a standalone HTML file
   * write_report_pdf — structured-input → professionally styled PDF report
 """
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
-import socket
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse
 
-import httpx
 from langchain.tools import tool
 
-# ── Jina web tools ───────────────────────────────────────────────────────
-
-_JINA_SEARCH = "https://s.jina.ai/"
-_JINA_READER = "https://r.jina.ai/"
-_HTTP_TIMEOUT = 30.0
-
-
-def _jina_headers(**extra: str) -> dict[str, str]:
-    headers = {"Accept": "application/json", **extra}
-    if key := os.environ.get("JINA_API_KEY"):
-        headers["Authorization"] = f"Bearer {key}"
-    return headers
-
-
-def _safe_public_url(url: str) -> str | None:
-    """Return an error string if `url` is unsafe, else None."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return "Error: malformed URL"
-    if parsed.scheme not in {"http", "https"}:
-        return f"Error: only http/https allowed (got {parsed.scheme!r})"
-    if not parsed.hostname:
-        return "Error: URL missing host"
-    try:
-        infos = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror:
-        return f"Error: cannot resolve host {parsed.hostname!r}"
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return f"Error: refusing to fetch internal address ({ip})"
-    return None
-
-
-@tool
-def web_search(query: str, max_results: int = 5) -> str:
-    """Search the web via Jina. Returns a text digest of the top results.
-
-    Args:
-        query: Search string.
-        max_results: Number of hits to return (1..20).
-    """
-    max_results = max(1, min(20, max_results))
-    headers = _jina_headers(**{"X-Return-Format": "text", "X-Max-Results": str(max_results)})
-    try:
-        resp = httpx.get(_JINA_SEARCH + quote(query), headers=headers, timeout=_HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        return f"Error: web_search failed — {e}"
-    return resp.text[:8000]
-
-
-@tool
-def read_webpage(url: str) -> str:
-    """Fetch a URL and return its main content as markdown.
-
-    Args:
-        url: Full http(s) URL.
-    """
-    if err := _safe_public_url(url):
-        return err
-    headers = _jina_headers(**{
-        "Accept": "text/markdown",
-        "X-Return-Format": "markdown",
-        "X-Skip-Images": "true",
-        "X-Skip-Scripts": "true",
-    })
-    try:
-        resp = httpx.get(_JINA_READER + url, headers=headers, timeout=_HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        return f"Error: read_webpage failed — {e}"
-    return resp.text[:12000]
-
+from coding_agent.tools import web_fetch, web_search
 
 # ── show_widget ──────────────────────────────────────────────────────────
 
@@ -351,4 +275,4 @@ def write_report_pdf(
     return f"PDF written: {p}"
 
 
-ALL_TOOLS = [web_search, read_webpage, show_widget, write_report_pdf]
+ALL_TOOLS = [web_search, web_fetch, show_widget, write_report_pdf]

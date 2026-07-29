@@ -25,7 +25,7 @@ Core tools
 ----------
 - ls, read_file, write_file, edit_file, glob, grep   filesystem (jailed to workspace)
 - execute                                            run shell commands
-- web_search, read_webpage                           internet access (Jina)
+- web_search, web_fetch                              internet access (Tavily)
 - show_widget                                        draw mermaid/HTML diagrams
 - write_todos                                        plan and track multi-step work
 

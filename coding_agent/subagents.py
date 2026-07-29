@@ -27,9 +27,6 @@ from coding_agent.tools import (
     git,
     git_diff,
     multi_edit,
-    run_lint,
-    run_tests,
-    run_type_check,
     think,
     visual_analyze,
     web_fetch,
@@ -127,10 +124,9 @@ Approach:
 2. Make the edit with `edit_file` (preferred) or `multi_edit` for
    multi-spot single-file changes. `write_file` only for genuinely
    new files.
-3. Run verification immediately after — `run_type_check`,
-   `run_lint`, and the most targeted `run_tests` invocation you can
-   justify. Use `execute` for project-specific commands the runners
-   don't cover.
+3. Run verification immediately after with `execute` — the project's
+   type checker, linter, and the most targeted test invocation you can
+   justify (e.g. `execute("pytest tests/test_x.py -q")`).
 4. Loop on failure: read the error, decide if the fix is in scope,
    apply it, re-verify. Stop after 3 failed attempts and report.
 
@@ -186,9 +182,6 @@ SUBAGENTS: list[SubAgent] = [
             multi_edit,
             git,
             git_diff,
-            run_tests,
-            run_type_check,
-            run_lint,
             think,
             visual_analyze,
         ],

@@ -37,12 +37,15 @@ the permission policy above.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 import re
 import threading
-from typing import Callable, Literal
+from typing import Literal
 
 from koda.modes import Mode
+from koda.web.policy import INTERRUPT_ON, SessionPolicy
 
 _log = logging.getLogger("koda.permissions")
 
@@ -93,22 +96,9 @@ def mark_prompt_resolved() -> None:
 
 # ── Module state — single-process truth source ─────────────────────────
 #
-# ``_current_mode`` is the live mode. The TUI mutates it through
-# ``set_mode``; the adapter reads it via ``decide``. A plain module var is
-# fine because all relevant code runs in one process under one event loop.
-_current_mode: Mode = Mode.DEFAULT
-
-# Tools the user has explicitly "always allowed" for this session.
-# Keyed by tool name — args are not part of the key on purpose; matching
-# args here would force a prompt for every distinct invocation, which
-# defeats the point of the "always" escape hatch.
-_session_allow: set[str] = set()
-
-# Blanket auto-approve for unattended runs (``koda --no-tui -y`` and the eval
-# harness). When set, ``decide`` approves every gated tool — including
-# ``execute`` and the dangerous-execute backstop — because there is no human
-# to answer a prompt. Off by default; only headless callers flip it on.
-_auto_approve: bool = False
+# (Legacy module-level state removed; all policy state now lives in
+# ``SessionPolicy``. The default policy below keeps single-process TUI/CLI
+# behaviour unchanged.)
 
 
 # ── Tool classification ────────────────────────────────────────────────
@@ -117,6 +107,13 @@ _auto_approve: bool = False
 # tools wired into ``create_deep_agent(interrupt_on=…)`` (see
 # ``coding_agent/agent.py``); every other tool (ls, read_file, glob, grep,
 # web_search, git, …) is read-only and never interrupts.
+#
+# DANGER: these are string names, and ``decide()`` FAILS OPEN — a tool that
+# isn't listed here is approved without a prompt. So if one of these names ever
+# drifts from the live tool set (a deepagents rename, a local refactor), that
+# tool silently stops being gated and PLAN mode stops blocking it, with no
+# error anywhere. ``tests/test_permission_tool_names.py`` diffs this set
+# against the real graph's tools to make that a test failure instead.
 MUTATING_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit", "execute", "bash_background"}
 
 # Subset of MUTATING_TOOLS that count as "file edits" — these pass through
@@ -194,173 +191,73 @@ INTERRUPT_ON: dict[str, dict] = {
 Verdict = Literal["approve", "reject", "ask"]
 
 
+# ── Context-aware default policy (legacy TUI compatibility) ────────────
+
+# The web server creates a SessionPolicy per run and injects it into adapters
+# via a context variable. The legacy TUI/bridge runs a single session per
+# process, so it continues to use the module-level default policy below.
+_policy_ctx: contextvars.ContextVar[SessionPolicy | None] = contextvars.ContextVar(
+    "koda_active_policy", default=None
+)
+_default_policy = SessionPolicy()
+
+
+def _active_policy() -> SessionPolicy:
+    return _policy_ctx.get() or _default_policy
+
+
+@contextlib.contextmanager
+def policy_context(policy: SessionPolicy):
+    """Return a context manager that sets the active policy for this run."""
+    token = _policy_ctx.set(policy)
+    try:
+        yield
+    finally:
+        _policy_ctx.reset(token)
+
+
 # ── Public API ─────────────────────────────────────────────────────────
 
 
 def current_mode() -> Mode:
-    return _current_mode
+    return _active_policy().mode
 
 
 def set_mode(mode: Mode) -> None:
-    global _current_mode
-    _current_mode = mode
+    _active_policy().set_mode(mode)
     _log.info("mode → %s", mode.value)
 
 
 def set_auto_approve(on: bool) -> None:
-    """Approve every gated tool for the rest of this session.
-
-    Used by unattended entry points — ``koda --no-tui --auto-approve`` and the
-    SWE-bench eval harness — where no human can answer a permission prompt.
-    Once on, ``decide`` short-circuits to ``"approve"`` for everything
-    (overriding PLAN reject and the dangerous-execute backstop), so only flip
-    it on when the working tree is disposable (a one-shot run or a throwaway
-    clone)."""
-    global _auto_approve
-    _auto_approve = on
+    _active_policy().set_auto_approve(on)
     _log.info("auto-approve → %s", on)
 
 
 def is_auto_approve() -> bool:
-    return _auto_approve
+    return _active_policy().auto_approve
 
 
 def allow_tool(tool_name: str) -> None:
-    """Add a tool to the session allow-list. Subsequent calls auto-approve."""
-    _session_allow.add(tool_name)
+    _active_policy().allow_tool(tool_name)
     _log.info("session-allow: %s", tool_name)
 
 
 def is_allowed(tool_name: str) -> bool:
-    return tool_name in _session_allow
+    return _active_policy().is_allowed(tool_name)
 
 
 def clear_session_allow() -> None:
-    """Reset the session allow-list. Called on /clear so a new chat starts
-    from a clean permission slate."""
-    global _auto_approve
-    _session_allow.clear()
-    _auto_approve = False
+    _active_policy().allowed.clear()
+    _active_policy().set_auto_approve(False)
 
 
 def reject_message(tool_name: str) -> str:
-    """The message handed back to the model when a gated call is rejected.
-
-    In PLAN mode this nudges the agent to stay advisory; otherwise it's a
-    plain "the user said no" so the model can adapt instead of retrying.
-    """
-    if _current_mode is Mode.PLAN:
-        return (
-            f"[plan mode] `{tool_name}` is disabled. Outline the change in your "
-            "reply; the user will press Shift+A (or send 'apply') to switch to "
-            "default mode and execute it."
-        )
-    return f"[denied] The user rejected `{tool_name}`."
+    return _active_policy().reject_message(tool_name)
 
 
 def decide(tool_name: str, args: dict | None = None) -> Verdict:
-    """Decide what to do with a gated tool call, *without* prompting.
-
-    Returns one of ``"approve"`` / ``"reject"`` / ``"ask"``. The adapter
-    auto-resolves approve/reject and only surfaces a prompt for ``"ask"``.
-
-      * ``PLAN``  → ``"reject"`` for every mutating tool (advisory-only).
-      * dangerous ``execute`` → ``"ask"`` (overrides session-allow / EDITS).
-      * session-allowed tool → ``"approve"`` (honoured before EDITS, so an
-        explicit "always" wins over the EDITS ``rm`` guard).
-      * ``EDITS`` → ``"approve"`` for file edits *and* shell calls, except
-        shell calls that remove files (``rm``) → ``"ask"``.
-      * otherwise → ``"ask"``.
-
-    A non-mutating tool should never reach here (it isn't in
-    ``interrupt_on``); if one does, default to ``"approve"`` so we never
-    wedge on an unexpected interrupt.
-    """
-    if tool_name not in MUTATING_TOOLS:
-        return "approve"
-
-    # Unattended runs approve everything — checked before PLAN and the
-    # dangerous-execute backstop, since neither has a human to fall back on.
-    if _auto_approve:
-        return "approve"
-
-    mode = _current_mode
-    if mode is Mode.PLAN:
-        return "reject"
-    # Catastrophic shell commands always surface a prompt — the session-allow
-    # escape hatch and EDITS auto-approve must not wave a disk-wide walk or an
-    # ``rm -rf /`` straight through. Checked before those two branches.
-    if tool_name in ("execute", "bash_background") and is_dangerous_execute((args or {}).get("command", "")):
-        _log.warning("dangerous %s forced to ask: %r", tool_name, (args or {}).get("command", "")[:120])
-        return "ask"
-    # An explicit "always allow" from the user wins over mode-specific rules —
-    # once the user has accepted a tool for the session, honour it everywhere
-    # (including ACCEPT-EDITS, so the ``rm`` guard below doesn't re-prompt on
-    # a tool the user already opted into for the rest of the session).
-    if tool_name in _session_allow:
-        return "approve"
-    if mode is Mode.EDITS:
-        # File writes/edits auto-approve silently.
-        if tool_name in FILE_EDIT_TOOLS:
-            return "approve"
-        # Shell calls auto-approve too — *except* file removal (``rm``). A stray
-        # ``rm`` is the one destructive shell verb that still asks, because it
-        # is easy to trigger by accident and hard to undo. ``rm`` flagged by
-        # ``is_dangerous_execute`` above is already handled; this catches the
-        # ordinary ``rm somefile`` case.
-        if tool_name in ("execute", "bash_background"):
-            if _is_rm_command((args or {}).get("command", "")):
-                return "ask"
-            return "approve"
-        # Any other mutating tool in EDITS (future-proofing) falls through to ask.
-    return "ask"
+    return _active_policy().decide(tool_name, args)
 
 
-# ── Legacy synchronous gate (for sync @tool backends) ──────────────────
-#
-# The ``coding_agent`` graph gates via LangGraph's ``interrupt_on`` and the
-# adapter — it does NOT use the functions below. But the ``deep`` adapter
-# (``koda/adapters/deep.py``) wires plain synchronous ``@tool`` functions
-# from ``koda/tools/fs.py`` that can't pause a graph, so they keep using
-# this blocking gate: ``check()`` returns ``None`` to allow or a refusal
-# string to deny, prompting via ``_prompt_hook`` for the ``"ask"`` case.
-#
-# The hook (installed by the TUI as ``KodaApp._prompt_from_tool_thread``)
-# runs on a *worker* thread and blocks only that thread — never the event
-# loop — so it doesn't freeze the TUI. Headless callers (no hook) degrade
-# to allow so tests/scripts don't deadlock.
-
-PromptHook = Callable[[str, dict], bool]
-_prompt_hook: PromptHook | None = None
 
 
-def set_prompt_hook(hook: PromptHook | None) -> None:
-    """Install (or remove) the blocking permission prompt used by ``check``."""
-    global _prompt_hook
-    _prompt_hook = hook
-
-
-def check(tool_name: str, args: dict | None = None) -> str | None:
-    """Synchronous gate for sync-``@tool`` backends (the ``deep`` adapter).
-
-    Returns ``None`` to allow the tool to run, or a refusal string the tool
-    should hand back to the model. Reuses :func:`decide` for the policy and
-    prompts via the installed hook when the verdict is ``"ask"``. The
-    ``coding_agent`` graph does not call this — it pauses the graph via
-    ``interrupt_on`` instead.
-    """
-    verdict = decide(tool_name, args or {})
-    if verdict == "approve":
-        return None
-    if verdict == "reject":
-        return reject_message(tool_name)
-    # "ask" — prompt the user via the blocking hook.
-    if _prompt_hook is None:
-        # Headless (no TUI) — allow so non-interactive consumers don't hang.
-        return None
-    try:
-        allowed = _prompt_hook(tool_name, args or {})
-    except Exception:
-        _log.exception("permission hook raised; denying")
-        return f"[denied] permission prompt failed for {tool_name}."
-    return None if allowed else f"[denied] User rejected `{tool_name}`."

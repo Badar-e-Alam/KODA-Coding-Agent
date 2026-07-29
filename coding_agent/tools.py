@@ -2,14 +2,17 @@
 
 deepagents already provides: `execute` (shell), `read_file`, `write_file`,
 `edit_file`, `ls`, `glob`, `grep`, `write_todos`, `task`. This module only
-defines tools that have no deepagents equivalent and are needed for the
-KODA coding workflow: `think`, `multi_edit`, web access, image analysis (Gemma vision via Ollama), read-only git,
-`run_tests`, `run_type_check`, `run_lint`.
+defines tools with **no deepagents equivalent**: `think`, `multi_edit`, web
+access, image analysis (Gemma vision via Ollama), read-only git, and the
+background-shell trio.
 
-The runner tools (``run_tests`` / ``run_type_check`` / ``run_lint``) follow
-the same shape on purpose: auto-detect the framework, run with a hard
-timeout, return a small structured header + the *tail* of the output so
-failures land in the model's context without bloating it.
+There is deliberately no ``run_tests`` / ``run_type_check`` / ``run_lint``.
+They used to live here — ~310 lines that guessed the project's framework from
+files on disk, shelled out, and regex-parsed the output into a summary. But
+``execute`` already runs the command, and a model reads raw pytest output more
+reliably than our regexes summarised it. Every tool definition also ships its
+schema on every request, so a tool that duplicates ``execute`` costs tokens on
+every turn and buys nothing. The agent just runs ``execute("pytest -q")``.
 
 All tools here use LangChain's `@tool` decorator so they slot directly
 into `create_deep_agent(..., tools=EXTRA_TOOLS)`.
@@ -17,7 +20,6 @@ into `create_deep_agent(..., tools=EXTRA_TOOLS)`.
 
 import atexit
 import base64
-import json
 import os
 import re
 import signal
@@ -118,6 +120,41 @@ def multi_edit(path: str, edits: list[FindReplace]) -> str:
 
 # ── web tools ──────────────────────────────────────────────────────────
 
+# Max redirect hops for web_fetch. Each hop is re-validated (see _public_url_error).
+_MAX_REDIRECTS = 5
+
+
+def _public_url_error(url: str) -> str | None:
+    """Return an error string if ``url`` isn't a safe public http(s) URL, else None.
+
+    SSRF guard. ``web_fetch`` runs inside the user's network, so without this a
+    model (or a prompt-injected page) could reach loopback, RFC1918 hosts, or the
+    cloud metadata endpoint at 169.254.169.254 and exfiltrate credentials.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "[error] invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"[error] only http/https URLs allowed (got {parsed.scheme!r})"
+    host = parsed.hostname
+    if not host:
+        return "[error] URL missing host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return f"[error] cannot resolve host {host!r}"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        # link_local covers 169.254.0.0/16 — the cloud metadata service.
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return f"[error] refusing to fetch private/internal address ({ip}) for {host!r}"
+    return None
+
 
 @tool
 def web_fetch(url: str, max_chars: int = 20_000) -> str:
@@ -126,22 +163,44 @@ def web_fetch(url: str, max_chars: int = 20_000) -> str:
     Use when you need to read external docs, an API reference, a Stack
     Overflow answer, or any page to inform your work. HTML is stripped to
     body text. Set `max_chars` higher for long pages, lower to save tokens.
+
+    Only public http(s) addresses are reachable; private/loopback/link-local
+    hosts are refused, including via redirect.
     """
     try:
         import httpx
     except ImportError:
         return "[error] httpx not installed; cannot fetch URLs"
+
+    # Redirects are followed MANUALLY so every hop gets the SSRF check. With
+    # httpx's follow_redirects=True, a public URL that 302s to 169.254.169.254
+    # would sail straight past a check done only on the original URL.
+    seen = url
     try:
-        r = httpx.get(
-            url,
-            follow_redirects=True,
-            timeout=15.0,
-            headers={"User-Agent": "koda-coding-agent/1.0"},
-        )
+        for _ in range(_MAX_REDIRECTS + 1):
+            err = _public_url_error(seen)
+            if err:
+                return err
+            r = httpx.get(
+                seen,
+                follow_redirects=False,
+                timeout=15.0,
+                headers={"User-Agent": "koda-coding-agent/1.0"},
+            )
+            if not r.is_redirect:
+                break
+            location = r.headers.get("location")
+            if not location:
+                return f"[error] HTTP {r.status_code} redirect with no Location for {seen}"
+            seen = str(httpx.URL(seen).join(location))
+        else:
+            return f"[error] too many redirects (>{_MAX_REDIRECTS}) starting at {url}"
     except Exception as e:
         return f"[error] fetch failed: {e}"
+
     if r.status_code >= 400:
-        return f"[error] HTTP {r.status_code} for {url}"
+        return f"[error] HTTP {r.status_code} for {seen}"
+    url = seen
     text = r.text
     ct = (r.headers.get("content-type") or "").lower()
     if "html" in ct:
@@ -467,320 +526,6 @@ def git_diff(path: str = ".", staged: bool = False, file: str = "") -> str:
     return _git(args, cwd=path)
 
 
-# ── run_tests ──────────────────────────────────────────────────────────
-
-
-def _detect_test_framework(root: Path) -> str:
-    if (root / "pytest.ini").exists() or (root / "tests").is_dir():
-        return "pytest"
-    pyproject = root / "pyproject.toml"
-    if pyproject.exists():
-        try:
-            txt = pyproject.read_text()
-            if "[tool.pytest" in txt or "pytest" in txt:
-                return "pytest"
-        except OSError:
-            pass
-    pkg = root / "package.json"
-    if pkg.exists():
-        try:
-            data = json.loads(pkg.read_text())
-            deps = {**data.get("devDependencies", {}), **data.get("dependencies", {})}
-            if "jest" in deps:
-                return "jest"
-            if data.get("scripts", {}).get("test"):
-                return "npm-test"
-        except (OSError, json.JSONDecodeError):
-            pass
-    if (root / "Cargo.toml").exists():
-        return "cargo"
-    if (root / "go.mod").exists():
-        return "go"
-    return ""
-
-
-def _summarize_tests(framework: str, output: str) -> str:
-    if framework == "pytest":
-        m = re.search(r"^=+ (.+?) =+\s*$", output, flags=re.M)
-        return m.group(1) if m else "(no pytest summary line)"
-    if framework == "jest":
-        tests = re.search(r"^Tests:\s+(.+)$", output, flags=re.M)
-        suites = re.search(r"^Test Suites:\s+(.+)$", output, flags=re.M)
-        parts = []
-        if suites:
-            parts.append(f"suites: {suites.group(1)}")
-        if tests:
-            parts.append(f"tests: {tests.group(1)}")
-        return ", ".join(parts) if parts else "(no jest summary)"
-    if framework == "cargo":
-        m = re.search(r"test result: (.+)", output)
-        return m.group(1) if m else "(no cargo summary)"
-    if framework == "go":
-        if "FAIL" in output:
-            fails = re.findall(r"--- FAIL: (\S+)", output)
-            return f"FAIL ({len(fails)} failing): {', '.join(fails[:5])}"
-        return "ok" if "ok" in output else "(no go summary)"
-    return "(parser not implemented)"
-
-
-@tool
-def run_tests(framework: str = "auto", extra_args: str = "", path: str = ".") -> str:
-    """Run the project's test suite and return a structured summary.
-
-    `framework='auto'` (default) detects pytest / jest / cargo / go / npm-test
-    by inspecting the project root. Override to force a specific runner.
-    Pass extra runner flags / target patterns via ``extra_args``
-    (e.g. ``"-k login"``, ``"--collect-only"``, ``"tests/api"``).
-    The result includes: framework, exit code, summary line, and the tail
-    of stdout/stderr (last ~4 KB) so the model can read failure details
-    without ballooning the context.
-
-    Note: the second parameter is intentionally NOT named ``args`` —
-    LangChain's tool wrapper rewrites a kwarg literally named ``args``
-    to ``v__args`` when binding the call, which then surfaces as
-    ``TypeError: run_tests() got an unexpected keyword argument
-    'v__args'`` at invocation time. Keep it as ``extra_args``.
-    """
-    root = Path(path)
-    fw = framework if framework != "auto" else _detect_test_framework(root)
-    if not fw:
-        return "[error] could not auto-detect a test framework; pass framework= explicitly"
-
-    if fw == "pytest":
-        cmd = f"pytest --tb=short -q {extra_args}".strip()
-    elif fw == "jest":
-        cmd = f"npx --yes jest --silent {extra_args}".strip()
-    elif fw == "npm-test":
-        cmd = f"npm test --silent {extra_args}".strip()
-    elif fw == "cargo":
-        cmd = f"cargo test {extra_args}".strip()
-    elif fw == "go":
-        cmd = f"go test ./... {extra_args}".strip()
-    else:
-        return f"[error] unsupported framework: {fw}"
-
-    try:
-        r = subprocess.run(
-            cmd,
-            cwd=root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=_enriched_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return f"[error] {fw} timed out after 600s"
-
-    output = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
-    summary = _summarize_tests(fw, output)
-    tail = output[-4000:]
-    return f"framework={fw} exit={r.returncode}\nsummary: {summary}\n--output (tail)--\n{tail}"
-
-
-# ── run_type_check ─────────────────────────────────────────────────────
-
-
-def _detect_type_checker(root: Path) -> str:
-    """Pick a type checker based on what the project ships configuration for.
-
-    Order matters: a project may have both ``pyproject.toml`` (with mypy
-    settings) and ``tsconfig.json`` (for a JS sub-tree). Python config
-    wins for the root call; the model can pass an explicit ``checker=``
-    to target the JS side.
-    """
-    if (root / "mypy.ini").exists() or (root / ".mypy.ini").exists():
-        return "mypy"
-    if (root / "pyrightconfig.json").exists():
-        return "pyright"
-    pyproject = root / "pyproject.toml"
-    if pyproject.exists():
-        try:
-            txt = pyproject.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            txt = ""
-        if "[tool.mypy" in txt:
-            return "mypy"
-        if "[tool.pyright" in txt:
-            return "pyright"
-        # Python project, no explicit config → prefer mypy if any *.py exists.
-        if any(root.glob("**/*.py")):
-            return "mypy"
-    if (root / "tsconfig.json").exists():
-        return "tsc"
-    return ""
-
-
-def _summarize_type_check(checker: str, output: str) -> str:
-    if checker == "mypy":
-        m = re.search(r"^(Found \d+ error.+)$", output, flags=re.M)
-        if m:
-            return m.group(1)
-        if "Success: no issues" in output:
-            return "Success: no issues found"
-        return "(no mypy summary line)"
-    if checker == "pyright":
-        m = re.search(r"^(\d+ errors?,\s*\d+ warnings?,.*)$", output, flags=re.M)
-        return m.group(1) if m else "(no pyright summary line)"
-    if checker == "tsc":
-        errors = re.findall(r"error TS\d+", output)
-        return f"{len(errors)} TypeScript error(s)" if errors else "no TypeScript errors"
-    return "(parser not implemented)"
-
-
-@tool
-def run_type_check(checker: str = "auto", extra_args: str = "", path: str = ".") -> str:
-    """Run a static type checker and return a structured summary.
-
-    ``checker='auto'`` (default) detects mypy / pyright / tsc by inspecting
-    the project root. Static analysis catches a large fraction of bugs
-    before tests even run — call this first on a bug-fix turn.
-
-    Args:
-        checker: ``auto``, ``mypy``, ``pyright``, or ``tsc``.
-        extra_args: flags / target paths to append (e.g. ``"--strict
-            koda/tui/"``, ``"--project tsconfig.build.json"``).
-        path: project root. Defaults to the cwd.
-
-    Returns:
-        ``checker=<name> exit=<code>`` followed by a one-line summary and
-        the tail (~4 KB) of stdout/stderr. The tail keeps failure detail
-        in context without ballooning prompt size.
-    """
-    root = Path(path)
-    ck = checker if checker != "auto" else _detect_type_checker(root)
-    if not ck:
-        return "[error] could not auto-detect a type checker; pass checker= explicitly"
-
-    if ck == "mypy":
-        cmd = f"mypy {extra_args or '.'}".strip()
-    elif ck == "pyright":
-        cmd = f"pyright {extra_args}".strip()
-    elif ck == "tsc":
-        # ``--noEmit`` keeps tsc as a checker only — without it the call
-        # would also write .js files into the tree, which is surprising.
-        cmd = f"npx --yes tsc --noEmit {extra_args}".strip()
-    else:
-        return f"[error] unsupported checker: {ck}"
-
-    try:
-        r = subprocess.run(
-            cmd,
-            cwd=root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=_enriched_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return f"[error] {ck} timed out after 300s"
-
-    output = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
-    summary = _summarize_type_check(ck, output)
-    tail = output[-4000:]
-    return f"checker={ck} exit={r.returncode}\nsummary: {summary}\n--output (tail)--\n{tail}"
-
-
-# ── run_lint ───────────────────────────────────────────────────────────
-
-
-def _detect_linter(root: Path) -> str:
-    """Pick a linter by config-file presence, falling back to language."""
-    if (root / "ruff.toml").exists() or (root / ".ruff.toml").exists():
-        return "ruff"
-    pyproject = root / "pyproject.toml"
-    if pyproject.exists():
-        try:
-            txt = pyproject.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            txt = ""
-        if "[tool.ruff" in txt:
-            return "ruff"
-    # ESLint configs come in many flavors — flat (eslint.config.*) and
-    # legacy (.eslintrc.*). Cover both.
-    for cand in ("eslint.config.js", "eslint.config.mjs", "eslint.config.cjs",
-                 ".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
-                 ".eslintrc.yml", ".eslintrc.yaml"):
-        if (root / cand).exists():
-            return "eslint"
-    # Fall back by language: prefer ruff for Python, eslint for JS/TS.
-    if any(root.glob("*.py")) or pyproject.exists():
-        return "ruff"
-    if (root / "package.json").exists():
-        return "eslint"
-    return ""
-
-
-def _summarize_lint(linter: str, output: str, exit_code: int) -> str:
-    if linter == "ruff":
-        m = re.search(r"^Found (\d+) error", output, flags=re.M)
-        if m:
-            return f"{m.group(1)} ruff finding(s)"
-        if exit_code == 0:
-            return "no ruff findings"
-        return "(no ruff summary)"
-    if linter == "eslint":
-        m = re.search(r"(\d+ problems?\s*\(\d+ errors?,\s*\d+ warnings?\))", output)
-        if m:
-            return m.group(1)
-        if exit_code == 0:
-            return "no eslint findings"
-        return "(no eslint summary)"
-    return "(parser not implemented)"
-
-
-@tool
-def run_lint(linter: str = "auto", extra_args: str = "", path: str = ".") -> str:
-    """Run a linter and return a structured summary.
-
-    ``linter='auto'`` (default) detects ruff / eslint by config-file
-    presence, then by language. Run this for cheap, fast feedback —
-    linters surface dead code, unused imports, wrong arity, and other
-    obvious-but-easy-to-miss issues without the cost of executing tests.
-
-    Args:
-        linter: ``auto``, ``ruff``, or ``eslint``.
-        extra_args: flags / paths to append (e.g. ``"--fix"``,
-            ``"--select E,F koda/"``, ``"--max-warnings 0 src/"``).
-        path: project root. Defaults to the cwd.
-
-    Returns:
-        ``linter=<name> exit=<code>`` followed by a summary and the tail
-        (~4 KB) of stdout/stderr.
-    """
-    root = Path(path)
-    ln = linter if linter != "auto" else _detect_linter(root)
-    if not ln:
-        return "[error] could not auto-detect a linter; pass linter= explicitly"
-
-    if ln == "ruff":
-        cmd = f"ruff check {extra_args or '.'}".strip()
-    elif ln == "eslint":
-        cmd = f"npx --yes eslint {extra_args or '.'}".strip()
-    else:
-        return f"[error] unsupported linter: {ln}"
-
-    try:
-        r = subprocess.run(
-            cmd,
-            cwd=root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            env=_enriched_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return f"[error] {ln} timed out after 180s"
-
-    output = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
-    summary = _summarize_lint(ln, output, r.returncode)
-    tail = output[-4000:]
-    return f"linter={ln} exit={r.returncode}\nsummary: {summary}\n--output (tail)--\n{tail}"
-
-
-
 # ── background shell (run_in_background / poll / kill) ───────────────────
 #
 # The framework's ``execute`` tool is synchronous — it blocks until the
@@ -1069,9 +814,6 @@ EXTRA_TOOLS = [
     visual_analyze,
     git,
     git_diff,
-    run_tests,
-    run_type_check,
-    run_lint,
     bash_background,
     bash_output,
     kill_bash,

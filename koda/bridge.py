@@ -72,7 +72,7 @@ from koda.agent_api import (
     Usage,
     describe_agent,
 )
-from koda import session_store
+from koda import session_store, skills
 from koda.subagent_tasks import BackgroundTaskRegistry
 from koda.tools import permissions as _perms
 from koda.modes import Mode
@@ -155,10 +155,11 @@ def _event_to_json(ev: Any) -> dict[str, Any] | None:
 def _perm_item_json(it: Any) -> dict[str, Any]:
     """Serialize one permission item, annotating the REAL on-disk target.
 
-    The agent's file tools jail absolute paths to the workspace root
-    (``/tmp/x`` actually lands at ``<cwd>/tmp/x`` — see koda/tools/fs.py),
-    so the raw ``file_path`` argument alone misleads the user about what
-    they're approving. ``resolved_path`` carries the true destination.
+    The backend runs in ``virtual_mode``, which jails absolute paths to the
+    project root — a model-supplied ``/tmp/x`` actually lands at ``<cwd>/tmp/x``
+    (see ``build_backend`` in coding_agent/backend.py). So the raw ``file_path``
+    argument alone misleads the user about what they're approving;
+    ``resolved_path`` carries the true destination.
     """
     d: dict[str, Any] = {
         "tool_name": getattr(it, "tool_name", ""),
@@ -205,65 +206,6 @@ def expand_at_files(text: str) -> str:
     return text + "".join(blocks)
 
 
-# ── skills authoring (/skill command) ───────────────────────────────────
-# Skills are read by deepagents' SkillsMiddleware (wired via skills=["/skills/"]
-# in coding_agent/agent.py). The /skill command lets the CONFIGURED model author
-# a spec-compliant SKILL.md and saves it into coding_agent/skills/<name>/, which
-# the middleware then surfaces to the agent (progressive disclosure).
-
-SKILL_AUTHOR_PROMPT = """You are authoring an Agent Skill file (SKILL.md) that follows Anthropic's Agent Skills specification.
-
-Write ONLY the complete SKILL.md content — no preamble, no explanation, and no surrounding code fences.
-
-It MUST begin with YAML frontmatter delimited by --- lines:
----
-name: <lowercase-hyphenated identifier, 1-64 chars, only a-z 0-9 and single hyphens>
-description: <one or two sentences saying WHAT the skill does AND WHEN to use it; include trigger keywords>
----
-
-Then a markdown body with these sections:
-# <Skill Title>
-## When to Use   — bullet list of situations that should trigger this skill
-## Instructions  — a concrete, numbered, step-by-step workflow the agent should follow
-## Notes         — optional pitfalls, tips, or a short example
-
-Make it specific and actionable — this is instructions for an AI coding agent, not marketing copy.
-
-The skill to author:
-{brief}
-"""
-
-
-def _slug(s: str) -> str:
-    """Normalize an arbitrary string into a spec-valid skill name."""
-    s = re.sub(r"[^a-z0-9]+", "-", s.strip().lower())
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:64]
-
-
-def _clean_skill_md(text: str) -> str:
-    """Strip a wrapping code fence the model may have added; ensure trailing NL."""
-    t = text.strip()
-    m = re.match(r"^```[a-zA-Z]*\s*\n(.*)\n```$", t, re.DOTALL)
-    if m:
-        t = m.group(1).strip()
-    return t + "\n"
-
-
-def _skill_frontmatter(content: str) -> dict[str, Any]:
-    """Parse the YAML frontmatter mapping from SKILL.md content (or {})."""
-    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        import yaml
-
-        data = yaml.safe_load(m.group(1))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
 # ── the bridge ──────────────────────────────────────────────────────────
 
 
@@ -290,11 +232,11 @@ class Bridge:
         # Set when the client sends "interrupt"; _run_turn confirms with an
         # info event once the turn actually unwinds.
         self._interrupted = False
-        # Blocking hooks (the agent's ask_user tool, and the deep adapter's
-        # sync permission gate) run on LangGraph worker threads; each parks on
-        # a Future that the stdin reader resolves when the client answers.
+        # The agent's ask_user tool blocks on a LangGraph worker thread; it
+        # parks on a Future that the stdin reader resolves when the client
+        # answers. (Permission prompts do NOT use this path — they pause the
+        # whole graph via LangGraph's interrupt(); see _apply_decisions.)
         self._ask_future: concurrent.futures.Future | None = None
-        self._hook_future: concurrent.futures.Future | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -320,18 +262,13 @@ class Bridge:
         except Exception:
             _log.debug("subagent tools bind failed", exc_info=True)
         # Route the agent's ask_user tool to the client instead of the headless
-        # sentinel, and give sync-gated backends (the `deep` adapter's plain
-        # @tool permission check) a real prompt path over the wire.
+        # sentinel.
         try:
             from koda.tools import ask_user as _ask
 
             _ask.set_hook(self._ask_user_hook)
         except Exception:
             _log.debug("ask_user hook install failed", exc_info=True)
-        try:
-            _perms.set_prompt_hook(self._sync_permission_hook)
-        except Exception:
-            _log.debug("permission hook install failed", exc_info=True)
         self._emit_ready()
         # Model list for the client's /model completion — discovery can hit the
         # network (Ollama /api/tags etc.), so it must not delay readiness.
@@ -355,41 +292,6 @@ class Bridge:
             return "[ask_user timeout] The user didn't answer; proceed with your best guess."
         finally:
             self._ask_future = None
-
-    def _sync_permission_hook(self, tool_name: str, args: dict) -> bool:
-        """Blocking permission prompt for sync ``@tool`` backends (deep adapter).
-
-        Without this, ``koda.tools.permissions.check`` has no hook under the
-        bridge and silently ALLOWS every mutating tool. Emits the same
-        ``permission_request`` event the interrupt flow uses; the client's
-        ``decisions`` command resolves it (see ``_apply_decisions``).
-        """
-        if self._loop is None:
-            return False
-        fut: concurrent.futures.Future = concurrent.futures.Future()
-        self._hook_future = fut
-        item = {
-            "tool_name": tool_name,
-            "args": args or {},
-            "allowed_decisions": ["approve", "reject"],
-            "description": "",
-        }
-        fp = (args or {}).get("file_path")
-        if isinstance(fp, str) and fp.startswith("/"):
-            item["resolved_path"] = os.path.join(os.getcwd(), fp.lstrip("/"))
-        self._loop.call_soon_threadsafe(
-            emit, {"type": "permission_request", "items": [item]}
-        )
-        try:
-            outcome = str(fut.result(timeout=600))
-        except concurrent.futures.TimeoutError:
-            return False
-        finally:
-            self._hook_future = None
-        if outcome == "always":
-            _perms.allow_tool(tool_name)
-            return True
-        return outcome == "allow"
 
     async def _emit_models(self) -> None:
         """Send the discovered ``provider:model`` list for /model completion."""
@@ -460,19 +362,38 @@ class Bridge:
             )
 
     def _emit_ready(self) -> None:
+        """The handshake — and the ONLY source the welcome panel draws from.
+
+        Everything the TUI's left panel shows (model, mount, skills, context,
+        tools) rides on this one event. The frontend deliberately owns no
+        scanner of its own: it used to keep a TypeScript copy of the context /
+        skills / MCP discovery in koda/workspace.py, and two copies of the same
+        knowledge in two languages drift with nothing able to catch it.
+        """
+        from koda import workspace
+
+        root = Path.cwd()
         desc = describe_agent(self._adapter)
+        found = skills.list_skills(root)
         emit(
             {
                 "type": "ready",
                 "model": self._model,
                 "backend": desc.backend,
-                "cwd": os.getcwd(),
+                "cwd": str(root),
                 "mode": _perms.current_mode().value,
                 "supports_thinking": desc.supports_thinking,
                 "supports_vision": desc.supports_vision,
-                "tools": [
-                    {"name": t.name, "description": t.description} for t in desc.tools
+                "tools": [{"name": t.name, "description": t.description} for t in desc.tools],
+                "skills": [
+                    {"name": s["name"], "description": s["description"]} for s in found
                 ],
+                "context": [
+                    {"name": c["name"], "loaded": c["loaded"], "exists": c["exists"]}
+                    for c in workspace.context_for(root)
+                ],
+                "mcp": [{"name": m["name"]} for m in workspace.mcp_for(root)],
+                "branch": workspace.git_branch(root),
             }
         )
 
@@ -561,6 +482,7 @@ class Bridge:
         # ── ordered (queue behind the current turn) ──────────────────
         await self._cmd_queue.put(cmd)
 
+
     def _task_control(self, cmd: dict[str, Any]) -> None:
         """User-driven background-task control from the UI (dashboard / /task …)."""
         reg = self._registry
@@ -622,40 +544,24 @@ class Bridge:
 
     # ── skills (/skill command) ──────────────────────────────────────
 
-    def _skills_dir(self) -> Path:
-        from coding_agent.backend import SKILLS_DIR
-
-        return SKILLS_DIR
-
-    def _list_skills(self) -> list[tuple[str, str]]:
-        """(name, description) for every skill on disk, sorted by name."""
-        out: list[tuple[str, str]] = []
-        for md in sorted(self._skills_dir().glob("*/SKILL.md")):
-            fm = _skill_frontmatter(md.read_text(encoding="utf-8")) if md.exists() else {}
-            out.append((str(fm.get("name") or md.parent.name), str(fm.get("description") or "")))
-        return out
-
-    def _author_skill(self, brief: str) -> str:
-        """One-shot call to the CONFIGURED model to write a SKILL.md."""
-        from koda.summarizer import create_chat_model
-
-        llm = create_chat_model(self._model)
-        resp = llm.invoke(SKILL_AUTHOR_PROMPT.format(brief=brief))
-        text = getattr(resp, "content", resp)
-        if isinstance(text, list):  # some providers return content blocks
-            text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in text)
-        return _clean_skill_md(str(text))
-
     async def _skill(self, cmd: dict[str, Any]) -> None:
-        """List skills, or author a new one with the settled LLM and save it."""
+        """List skills, or author a new one and save it. See :mod:`koda.skills`."""
         action = cmd.get("action")
         if action == "list":
-            skills = await asyncio.to_thread(self._list_skills)
-            if not skills:
+            found = await asyncio.to_thread(skills.list_skills, Path.cwd())
+            if not found:
                 emit({"type": "info", "message": "No skills yet. Create one with:  /skill new <name>: <what it does>"})
                 return
-            body = "\n".join(f"  • {n} — {d[:90]}" for n, d in skills)
-            emit({"type": "info", "message": f"Skills ({len(skills)}) in coding_agent/skills/:\n{body}"})
+            body = "\n".join(f"  • {s['name']} — {s['description'][:90]}" for s in found)
+            emit(
+                {
+                    "type": "info",
+                    "message": (
+                        f"Skills ({len(found)}) from coding_agent/skills/ (bundled) "
+                        f"and .koda/skills/ (this project, wins on name clash):\n{body}"
+                    ),
+                }
+            )
             return
 
         if action != "create":
@@ -669,38 +575,23 @@ class Bridge:
 
         emit({"type": "info", "message": f"Authoring skill with {self._model}…"})
         try:
-            content = await asyncio.to_thread(self._author_skill, brief)
+            content = await asyncio.to_thread(skills.author, self._model, brief)
         except Exception as e:
             emit({"type": "error", "message": f"skill authoring failed: {type(e).__name__}: {e}"})
             return
 
-        fm = _skill_frontmatter(content)
-        name = _slug(str(fm.get("name") or brief.split(":", 1)[0]))
-        if not name:
-            emit({"type": "error", "message": "could not determine a valid skill name — try naming it explicitly."})
+        path, err = await asyncio.to_thread(skills.save, Path.cwd(), content, brief)
+        if path is None:
+            emit({"type": "error", "message": err})
             return
-        # Keep the frontmatter name in sync with the directory (the spec requires
-        # they match, and the model may have slugged it differently).
-        if str(fm.get("name") or "") != name:
-            content = re.sub(r"(?m)^name:.*$", f"name: {name}", content, count=1)
-
-        dest = self._skills_dir() / name
-        if (dest / "SKILL.md").exists():
-            emit({"type": "error", "message": f"skill '{name}' already exists — pick another name or delete it first."})
-            return
-        try:
-            dest.mkdir(parents=True, exist_ok=True)
-            (dest / "SKILL.md").write_text(content, encoding="utf-8")
-        except Exception as e:
-            emit({"type": "error", "message": f"could not write skill: {e}"})
-            return
+        name = path.parent.name
         emit(
             {
                 "type": "info",
                 "message": (
-                    f"✓ Created skill '{name}' → coding_agent/skills/{name}/SKILL.md\n"
+                    f"✓ Created skill '{name}' → .koda/skills/{name}/SKILL.md\n"
                     f"  It loads into the skills list on your next session (/clear or restart); "
-                    f"the agent can read it now via that path."
+                    f"the agent can read it now via /project_skills/{name}/SKILL.md."
                 ),
             }
         )
@@ -732,7 +623,10 @@ class Bridge:
                 if isinstance(ev, ToolStart) and ev.name == "write_todos":
                     # Route todo snapshots to a dedicated event (compact
                     # inline checklist on the client), like the Textual UI.
-                    emit({"type": "todos", "todos": ev.arguments.get("todos", [])})
+                    todos = ev.arguments.get("todos", [])
+                    if not isinstance(todos, list):
+                        todos = []
+                    emit({"type": "todos", "todos": todos})
                     emit(
                         {
                             "type": "tool_start",
@@ -783,12 +677,6 @@ class Bridge:
         """Map per-item outcomes to LangGraph resume decisions and hand them
         back to the adapter, resuming the checkpointed graph. Mirrors
         ``KodaApp._on_permission_choice``."""
-        # A sync-gated backend (deep adapter) prompt takes priority: its worker
-        # thread is parked on _hook_future and there's exactly one item.
-        hook = self._hook_future
-        if hook is not None and not hook.done():
-            hook.set_result(outcomes[0] if outcomes else "deny")
-            return
         items = self._pending_perm_items or []
         decisions: list[dict[str, Any]] = []
         for i, item in enumerate(items):

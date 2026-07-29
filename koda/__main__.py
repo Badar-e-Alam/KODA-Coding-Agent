@@ -6,7 +6,6 @@ Usage — Interactive UI (default, inline Ink REPL; needs Node >=18)
     koda --model anthropic:claude-sonnet-4-6      # Specify model
     koda --model openai:gpt-4o                    # OpenAI
     koda --model ollama:llama3.1                  # Local Ollama
-    koda --agent deep                             # Built-in deep agent
     koda --agent module.ClassName                 # Custom KodaAgent class
     koda -r / --resume                            # Pick a past session at launch
     koda -c / --continue                          # Resume the most recent session
@@ -74,16 +73,10 @@ def _build_adapter_factory(spec: str):
     """Return a callable ``factory(model, thread_id) -> KodaAgent``.
 
     Resolution rules (same as before, but reusable across /model switches):
-      "deep"                    -> KODA built-in deep adapter
+      "coding_agent"            -> KODA's deepagents/LangGraph coding agent
       "module.path.ClassName"   -> custom factory that returns a KodaAgent
                                    (or a raw LangGraph graph — auto-wrapped)
     """
-    if spec == "deep":
-        from koda.adapters.deep import create_deep_adapter
-        return lambda model, thread_id: create_deep_adapter(
-            model=model, thread_id=thread_id
-        )
-
     if spec == "coding_agent":
         from koda.adapters.coding_agent import create_coding_agent_adapter
         return lambda model, thread_id: create_coding_agent_adapter(
@@ -112,8 +105,7 @@ def _build_adapter_factory(spec: str):
     print(f"Unknown agent: '{spec}'", file=sys.stderr)
     print(
         "Options:\n"
-        "  deep                    KODA built-in deep adapter (default)\n"
-        "  coding_agent            OpenAI-Agents-SDK coding agent (coding_agent/)\n"
+        "  coding_agent            KODA's deepagents/LangGraph coding agent (default)\n"
         "  module.ClassName        Custom factory returning a KodaAgent",
         file=sys.stderr,
     )
@@ -161,7 +153,7 @@ def main() -> None:
     parser.add_argument(
         "--agent", "-a",
         default="coding_agent",
-        help="Agent backend: 'coding_agent' (default), 'deep', or 'module.ClassName'",
+        help="Agent backend: 'coding_agent' (default) or 'module.ClassName'",
     )
     parser.add_argument(
         "--model", "-m",
