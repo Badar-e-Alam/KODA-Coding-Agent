@@ -58,15 +58,38 @@ else
 fi
 
 # ── venv + install ─────────────────────────────────────────────────────
+#
+# Prefer uv when available: uv's standalone CPython distributions (installed
+# by `uv python install`) don't ship a working `ensurepip`, so the stdlib
+# `python -m venv` can hang during its internal `ensurepip --upgrade` step.
+# `uv venv` creates the venv without ensurepip, and `uv pip install` populates
+# it directly — sidestepping the hang entirely.
+USE_UV=0
+if command -v uv >/dev/null 2>&1; then
+    USE_UV=1
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
     info "creating venv at $VENV_DIR"
-    "$PY" -m venv "$VENV_DIR"
+    if [ "$USE_UV" = 1 ]; then
+        # `uv venv` honors $UV_PYTHON / falls back to a discovered interpreter.
+        # Pin to the same Python we selected above so the version is predictable.
+        UV_PYTHON="$PY" uv venv "$VENV_DIR" >/dev/null
+    else
+        "$PY" -m venv "$VENV_DIR"
+    fi
 fi
-# shellcheck disable=SC1091
-. "$VENV_DIR/bin/activate"
+
 info "upgrading pip + installing koda[$EXTRAS]"
-python -m pip install --upgrade pip >/dev/null
-pip install -e "$CLONE_DIR[$EXTRAS]"
+if [ "$USE_UV" = 1 ]; then
+    VIRTUAL_ENV="$VENV_DIR" uv pip install --upgrade pip >/dev/null
+    VIRTUAL_ENV="$VENV_DIR" uv pip install -e "$CLONE_DIR[$EXTRAS]"
+else
+    # shellcheck disable=SC1091
+    . "$VENV_DIR/bin/activate"
+    python -m pip install --upgrade pip >/dev/null
+    pip install -e "$CLONE_DIR[$EXTRAS]"
+fi
 
 # ── inline (Ink) UI — Node deps ────────────────────────────────────────
 # Interactive `koda` is the inline Ink UI, which runs on Node (>=18). We do
