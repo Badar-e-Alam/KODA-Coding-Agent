@@ -119,10 +119,6 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_env="OLLAMA_API_KEY",
         parse=_parse_ollama,
         fallback=(
-<<<<<<< Updated upstream
-            "codellama", "deepseek-coder-v2", "gemma2",
-            "kimi-k2.6", "llama3.1", "llama3.2", "mistral", "phi3", "qwen2.5-coder",
-=======
             # Cloud-tagged exact model IDs for Ollama Cloud (preferred when
             # OLLAMA_API_KEY is set); local daemons usually pull the same names
             # with the "latest" tag, which the parser strips before display.
@@ -131,13 +127,16 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "deepseek-v4-pro:cloud",
             "glm-5.2",
             "glm-5.2:cloud",
+            "kimi-k2",
+            "kimi-k2:cloud",
             "kimi-k2.6",
             "kimi-k2.6:cloud",
             "kimi-k2.7-code:cloud",
             "kimi-k3:cloud",
+            "llama3.1",
+            "llama3.2",
             "minimax-m3:cloud",
             "qwen3-coder:latest",
->>>>>>> Stashed changes
         ),
         needs_key=False,
         cloud_url="https://ollama.com",
