@@ -40,7 +40,8 @@ import asyncio
 import logging
 import re
 import threading
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Literal
 
 from koda.modes import Mode
 
@@ -122,6 +123,51 @@ MUTATING_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit", "execute", 
 # Subset of MUTATING_TOOLS that count as "file edits" — these pass through
 # silently in EDITS mode.
 FILE_EDIT_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit"}
+
+# ── MCP tool policy ────────────────────────────────────────────────────
+#
+# Tools from external MCP servers are gated per tool, by name, from the
+# ``koda.permissions`` block of ``.mcp.json`` (see ``koda/mcp_config.py``).
+# The map is installed at graph-build time by ``coding_agent/agent.py`` —
+# which also rebuilds when ``.mcp.json`` changes — and read by ``decide``.
+#
+# An MCP server is third-party code operating on the user's accounts, so the
+# policy is deliberately conservative: anything not explicitly set to
+# ``allow`` asks, and ``deny`` refuses without a prompt. This is separate
+# from MUTATING_TOOLS because that set is KODA's own fixed tool list, while
+# this one changes with the user's config.
+_mcp_policy: dict[str, str] = {}
+
+
+def set_mcp_policy(policy: dict[str, str]) -> None:
+    """Install the per-MCP-tool policy (``{tool_name: allow|ask|deny}``)."""
+    global _mcp_policy
+    _mcp_policy = {str(k): str(v) for k, v in (policy or {}).items() if v in ("allow", "ask", "deny")}
+    _log.info("mcp policy: %d tool(s) — %d gated", len(_mcp_policy), len(gated_mcp_tools()))
+
+
+def mcp_policy() -> dict[str, str]:
+    """Snapshot of the per-MCP-tool policy (for the dashboards / tests)."""
+    return dict(_mcp_policy)
+
+
+def gated_mcp_tools() -> set[str]:
+    """MCP tools that must pause the graph (``ask`` or ``deny``).
+
+    ``allow`` tools are deliberately absent: adding them to ``interrupt_on``
+    would checkpoint and resume the graph on every call for no benefit.
+    """
+    return {name for name, policy in _mcp_policy.items() if policy != "allow"}
+
+
+def interrupt_on_map() -> dict[str, dict]:
+    """The full ``interrupt_on`` mapping for ``create_deep_agent``.
+
+    KODA's own mutating tools plus every MCP tool the user has left at
+    ``ask``/``deny``. Rebuilt whenever ``.mcp.json`` changes.
+    """
+    gated = {name: {"allowed_decisions": ["approve", "reject"]} for name in gated_mcp_tools()}
+    return {**INTERRUPT_ON, **gated}
 
 # ``execute`` commands that are dangerous enough to ALWAYS prompt, even when
 # the user has session-allowed ``execute`` or is in EDITS mode. This is the
@@ -235,6 +281,11 @@ def is_allowed(tool_name: str) -> bool:
     return tool_name in _session_allow
 
 
+def allowed_tools() -> list[str]:
+    """Sorted snapshot of the session allow-list (for the /perms dashboard)."""
+    return sorted(_session_allow)
+
+
 def clear_session_allow() -> None:
     """Reset the session allow-list. Called on /clear so a new chat starts
     from a clean permission slate."""
@@ -255,6 +306,11 @@ def reject_message(tool_name: str) -> str:
             "reply; the user will press Shift+A (or send 'apply') to switch to "
             "default mode and execute it."
         )
+    if _mcp_policy.get(tool_name) == "deny":
+        return (
+            f"[denied] `{tool_name}` is set to 'deny' for this project's MCP server. "
+            "Use another tool, or tell the user to change it in /mcp."
+        )
     return f"[denied] The user rejected `{tool_name}`."
 
 
@@ -272,10 +328,30 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
         shell calls that remove files (``rm``) → ``"ask"``.
       * otherwise → ``"ask"``.
 
+    MCP tools follow their own per-tool policy from ``.mcp.json`` (``allow``
+    / ``ask`` / ``deny``), set in the ``/mcp`` dashboard — see
+    :func:`set_mcp_policy`. PLAN mode and auto-approve still win over it:
+    plan mode is advisory for *everything*, and an unattended run has nobody
+    to answer a prompt.
+
     A non-mutating tool should never reach here (it isn't in
     ``interrupt_on``); if one does, default to ``"approve"`` so we never
     wedge on an unexpected interrupt.
     """
+    if tool_name in _mcp_policy:
+        if _auto_approve:
+            return "approve"
+        if _current_mode is Mode.PLAN:
+            return "reject"
+        policy = _mcp_policy[tool_name]
+        if policy == "allow":
+            return "approve"
+        if policy == "deny":
+            return "reject"
+        # "ask" — honour a session-scoped "always allow" for this tool so the
+        # user isn't re-prompted for the same MCP call all turn.
+        return "approve" if tool_name in _session_allow else "ask"
+
     if tool_name not in MUTATING_TOOLS:
         return "approve"
 

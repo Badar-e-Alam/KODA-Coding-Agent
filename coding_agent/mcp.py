@@ -33,6 +33,7 @@ of relying on (possibly stale) training data. Its two tools are
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -151,21 +152,125 @@ def _translate_spec(name: str, spec: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _with_stored_auth(servers: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Attach any stored OAuth token to each http/sse server connection.
+
+    Import is local and failure is swallowed: MCP is optional, and a problem
+    reading the credential store must not stop the agent from starting with
+    its built-in tools.
+    """
+    try:
+        from koda.mcp_auth import silent_provider
+    except Exception:
+        return servers
+
+    out: dict[str, dict[str, Any]] = {}
+    for name, conn in servers.items():
+        out[name] = conn
+        if conn.get("transport") not in ("http", "sse") or not conn.get("url"):
+            continue
+        headers = {k.lower(): v for k, v in (conn.get("headers") or {}).items()}
+        if "authorization" in headers:
+            continue  # user supplied their own key; leave it alone
+        try:
+            provider = silent_provider(str(conn["url"]), name)
+        except Exception:
+            _log.warning("could not load stored MCP credentials for %r", name, exc_info=True)
+            continue
+        if provider is not None:
+            out[name] = {**conn, "auth": provider}
+    return out
+
+
+# Per-server connect budget. Each server gets its own clock, so one slow or
+# hanging server can't consume the whole startup budget and starve the others.
+_PER_SERVER_TIMEOUT = 30
+
+# Outcome of the most recent :func:`load_mcp_tools` call, one entry per
+# configured server: ``{name, ok, tool_count, error?, needs_auth?}``. The
+# bridge reads this after a build to tell the user which servers actually came
+# up (see ``koda/bridge.py``); without it a server that failed to connect is
+# invisible except in the log.
+_last_report: list[dict[str, Any]] = []
+
+
+def last_load_report() -> list[dict[str, Any]]:
+    """Per-server outcome of the last tool load, for surfacing in the UI."""
+    return [dict(entry) for entry in _last_report]
+
+
+async def _load_one_server(name: str, connection: dict[str, Any]) -> tuple[list, dict[str, Any]]:
+    """Connect to a single server and return ``(tools, report_entry)``.
+
+    Never raises: a failure is returned as a report entry with ``ok: False``
+    so one dead server is a missing row rather than a missing tool set.
+    """
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    try:
+        client = MultiServerMCPClient({name: connection})
+        tools = await asyncio.wait_for(client.get_tools(), timeout=_PER_SERVER_TIMEOUT)
+    except TimeoutError:
+        _log.warning("MCP server %r timed out after %ds", name, _PER_SERVER_TIMEOUT)
+        return [], {
+            "name": name,
+            "ok": False,
+            "tool_count": 0,
+            "error": f"timeout ({_PER_SERVER_TIMEOUT}s)",
+            "needs_auth": False,
+        }
+    except Exception as exc:
+        try:
+            from koda.mcp_auth import explain
+
+            detail, needs_auth = explain(exc, name)
+        except Exception:
+            detail, needs_auth = f"{type(exc).__name__}: {exc}", False
+        _log.warning(
+            "MCP server %r failed: %s%s", name, detail, " [run /mcp and sign in]" if needs_auth else ""
+        )
+        return [], {
+            "name": name,
+            "ok": False,
+            "tool_count": 0,
+            "error": detail,
+            "needs_auth": needs_auth,
+        }
+
+    tools = list(tools)
+    _log.info("MCP server %r: %d tool(s)", name, len(tools))
+    return tools, {"name": name, "ok": True, "tool_count": len(tools)}
+
+
 async def load_mcp_tools(root: Path) -> list:
     """Load and return all tools from configured MCP servers.
 
     Returns a flat ``list`` of LangChain ``BaseTool`` objects ready to pass
     to ``create_deep_agent(tools=...)``. Returns ``[]`` when MCP is
     unavailable or unconfigured — the agent then runs with its built-in
-    tools only. Never raises: every failure path degrades to ``[]`` so a
-    missing/failed MCP server can't block agent startup.
+    tools only. Never raises: every failure path degrades so a missing or
+    failed MCP server can't block agent startup.
+
+    **Each server is loaded through its own client, concurrently.**
+    ``MultiServerMCPClient.get_tools()`` fans out over every server inside one
+    ``anyio`` task group and lets the first exception abort the group, so a
+    single unauthorized server (a cloud one the user hasn't signed into yet)
+    used to return *zero* tools for the whole session — Context7's two tools
+    disappeared because an unrelated Notion server answered 401. That made
+    "add it now, sign in later" a trap. One client per server means a failure
+    costs you that server's tools and nothing else.
+
+    See :func:`last_load_report` for the per-server outcome.
     """
+    global _last_report
+    _last_report = []
+
     servers = _load_mcp_config(root)
     if not servers:
         return []
 
     try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+        import langchain_mcp_adapters.client  # noqa: F401
     except ImportError:
         _log.warning(
             "langchain-mcp-adapters not installed — MCP tools disabled. "
@@ -173,15 +278,70 @@ async def load_mcp_tools(root: Path) -> list:
         )
         return []
 
-    _log.info("loading MCP tools from servers: %s", ", ".join(sorted(servers)))
-    client = MultiServerMCPClient(servers)
-    try:
-        tools = await client.get_tools()
-    except Exception as exc:
-        # A server may be unreachable, auth may fail, etc. Log and continue
-        # with zero MCP tools rather than crashing the whole agent build.
-        _log.warning("MCP get_tools() failed (%s: %s) — returning no MCP tools", type(exc).__name__, exc)
-        return []
+    # Attach stored OAuth tokens (Notion, Linear, Sentry, …). Servers the user
+    # hasn't signed into yet get no provider and will simply fail to connect;
+    # `/mcp` reports that as "needs authorization" rather than blocking the
+    # agent build on a browser. See koda/mcp_auth.py.
+    servers = _with_stored_auth(servers)
 
-    _log.info("loaded %d MCP tool(s): %s", len(tools), ", ".join(t.name for t in tools))
-    return list(tools)
+    _log.info("loading MCP tools from servers: %s", ", ".join(sorted(servers)))
+    ordered = sorted(servers)
+    results = await asyncio.gather(
+        *(_load_one_server(name, servers[name]) for name in ordered),
+        return_exceptions=True,
+    )
+
+    tools: list = []
+    seen: dict[str, str] = {}  # tool name -> the server that first claimed it
+    report: list[dict[str, Any]] = []
+
+    for name, result in zip(ordered, results, strict=False):
+        if isinstance(result, BaseException):
+            # _load_one_server handles its own errors, so this is a bug or a
+            # cancellation rather than a server problem. Record it and move on.
+            _log.warning("MCP server %r raised unexpectedly: %r", name, result)
+            report.append(
+                {
+                    "name": name,
+                    "ok": False,
+                    "tool_count": 0,
+                    "error": f"{type(result).__name__}: {result}",
+                    "needs_auth": False,
+                }
+            )
+            continue
+        server_tools, entry = result
+        kept = 0
+        for tool in server_tools:
+            tool_name = getattr(tool, "name", "")
+            owner = seen.get(tool_name)
+            if owner is not None:
+                # MCP tools arrive under their bare name, so two servers can
+                # both expose e.g. `query-docs`. Keeping both would give the
+                # model two identically-named tools and make the permission
+                # policy (also keyed by bare name) ambiguous. First server in
+                # alphabetical order wins, and we say which one lost.
+                _log.warning(
+                    "MCP tool %r from %r shadowed by %r — skipping the duplicate",
+                    tool_name,
+                    name,
+                    owner,
+                )
+                continue
+            seen[tool_name] = name
+            tools.append(tool)
+            kept += 1
+        entry["tool_count"] = kept
+        report.append(entry)
+
+    _last_report = report
+    ok = [e["name"] for e in report if e["ok"]]
+    failed = [e["name"] for e in report if not e["ok"]]
+    _log.info(
+        "loaded %d MCP tool(s) from %d/%d server(s)%s",
+        len(tools),
+        len(ok),
+        len(report),
+        f" — failed: {', '.join(failed)}" if failed else "",
+    )
+    return tools

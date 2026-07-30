@@ -9,7 +9,9 @@ built-in filesystem tools. Model resolution (including `kimi:` /
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import logging
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,18 +25,35 @@ from coding_agent.compaction import (
     build_context_editing_middleware,
     build_manual_compaction_engine,
 )
+from coding_agent.mcp import load_mcp_tools
 from coding_agent.model import resolve_model
 from coding_agent.subagents import SUBAGENTS
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
-from coding_agent.mcp import load_mcp_tools
+from coding_agent.system_prompt_v3 import SYSTEM_PROMPT_V3
 from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
-
 from koda.tools import permissions as _perms
+
+_log = logging.getLogger("koda.agent")
+
+
+def _active_system_prompt() -> str:
+    """The prompt template to render, v3 by default.
+
+    ``KODA_PROMPT_VERSION=v2`` falls back to ``system_prompt_v2`` — kept so a
+    prompt change can be A/B'd against the previous version on the same
+    harness (the only honest way to tell whether a rewrite helped) and rolled
+    back without a code edit. Both modules stay on disk; see the header of
+    ``system_prompt_v3.py`` for what changed and why.
+    """
+    if os.environ.get("KODA_PROMPT_VERSION", "").strip().lower() == "v2":
+        _log.info("using system prompt v2 (KODA_PROMPT_VERSION=v2)")
+        return SYSTEM_PROMPT_V2
+    return SYSTEM_PROMPT_V3
 
 
 def _render_system_prompt(root: Path) -> str:
-    """Substitute the per-session template fields into ``SYSTEM_PROMPT_V2``.
+    """Substitute the per-session template fields into the active prompt.
 
     Session-start granularity (not per-turn): the date is captured once
     when ``build_agent`` runs and stays stable across the compiled
@@ -44,11 +63,11 @@ def _render_system_prompt(root: Path) -> str:
 
     There is no longer a "bootstrap_required" field: KODA does not
     auto-create ``AGENTS.md`` at startup. The agent builds its knowledge
-    base organically (see the ``<Project knowledge base>`` block in the
-    prompt) only when it has something durable to record.
+    base organically (see the ``<knowledge_base>`` block in the prompt)
+    only when it has something durable to record.
     """
-    return SYSTEM_PROMPT_V2.format(
-        current_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    return _active_system_prompt().format(
+        current_date=datetime.now(UTC).strftime("%Y-%m-%d"),
         cwd=str(root.resolve()),
     )
 
@@ -134,6 +153,30 @@ def _load_async_subagents(root: Path) -> list[dict]:
     ]
 
 
+def _install_mcp_policy(root: Path, mcp_tools: list) -> None:
+    """Load the per-tool MCP policy from ``.mcp.json`` into the perm gate.
+
+    A tool that loaded but has no entry belongs to a server nobody has opened
+    in ``/mcp`` yet — no intent recorded — so it resolves to
+    ``UNCONFIGURED_POLICY`` (``allow``), which is how MCP tools behaved before
+    this existed. Adding a server through the dashboard caches its tools at
+    ``ask``, so anything the user actually configured is gated.
+    """
+    try:
+        from koda import mcp_config
+
+        policy = mcp_config.tool_permissions(root)
+        known = set(policy)
+        for tool in mcp_tools:
+            name = getattr(tool, "name", "")
+            if name and name not in known:
+                policy[name] = mcp_config.UNCONFIGURED_POLICY
+        _perms.set_mcp_policy(policy)
+    except Exception:
+        _log.warning("could not load MCP tool permissions; gating every MCP tool", exc_info=True)
+        _perms.set_mcp_policy({getattr(t, "name", ""): "ask" for t in mcp_tools if getattr(t, "name", "")})
+
+
 async def build_agent(
     *,
     model: str | None = None,
@@ -193,6 +236,15 @@ async def build_agent(
     mcp_tools = await load_mcp_tools(root)
     all_tools = list(EXTRA_TOOLS) + mcp_tools
 
+    # Per-tool MCP permissions (allow / ask / deny) come from the ``koda``
+    # block of .mcp.json and are managed in the /mcp dashboard. Install the
+    # policy before compiling: ``interrupt_on`` is bound at compile time, so
+    # the gated set has to be known now. Tools the user set to ``deny`` are
+    # gated too — the gate is what gives ``decide`` a chance to refuse them.
+    # Anything the server exposes that has no entry yet falls back to the
+    # server's ``defaultPermission`` (``ask``).
+    _install_mcp_policy(root, mcp_tools)
+
     # Remote async subagents (official deepagents transport) — when configured,
     # the AsyncSubAgentMiddleware owns start_async_task/…, so drop KODA's
     # in-process versions of those tool names.
@@ -223,7 +275,7 @@ async def build_agent(
         skills=["/skills/"],
         # System prompt is rendered per-session with current_date / cwd /
         # bootstrap_required substituted in. See _render_system_prompt
-        # and coding_agent/system_prompt_v2.py for the template.
+        # and coding_agent/system_prompt_v3.py for the template.
         system_prompt=_render_system_prompt(root),
         # Durable context auto-injected under <agent_memory> every turn:
         # AGENTS.md (the knowledge-base hub/index) and user_preferences.md
@@ -234,7 +286,7 @@ async def build_agent(
         # intentionally NOT auto-loaded — they can grow large and are read on
         # demand via the links in AGENTS.md. The agent creates any of these
         # files only when it has durable info to record; see the
-        # <Project knowledge base> block in coding_agent/system_prompt_v2.py.
+        # <knowledge_base> block in coding_agent/system_prompt_v3.py.
         memory=["/AGENTS.md", "/user_preferences.md"],
         # Persist graph state to disk so conversations survive restarts.
         # Caller must pass ``configurable.thread_id`` on invoke/stream;
@@ -249,7 +301,7 @@ async def build_agent(
         # ``Command(resume=…)`` once the user decides. The gated-tool set
         # and the approve/reject/ask policy both live in
         # ``koda/tools/permissions.py`` so they stay in one place.
-        interrupt_on=_perms.INTERRUPT_ON,
+        interrupt_on=_perms.interrupt_on_map(),
         # Specialist subagents (explore / plan / edit) the main agent
         # dispatches via the built-in ``task`` tool, plus any configured
         # REMOTE async subagents (identified by their ``graph_id`` field and

@@ -11,12 +11,46 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__all__ = ["update_env_file", "default_env_path"]
+__all__ = ["update_env_file", "read_env_file", "delete_env_keys", "default_env_path"]
 
 
 def default_env_path() -> Path:
     """The ``.env`` next to the process CWD (where ``load_dotenv`` reads)."""
     return Path(os.getcwd()) / ".env"
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        inner = value[1:-1]
+        return inner.replace('\\"', '"').replace("\\\\", "\\") if value[0] == '"' else inner
+    return value
+
+
+def read_env_file(path: str | Path | None = None) -> dict[str, str]:
+    """Parse the ``.env`` at ``path`` into a dict (comments/blanks skipped).
+
+    Used by the /setup dashboard to tell "set in .env" apart from "set in the
+    ambient environment" — a distinction the user needs, because only the
+    former survives the next launch.
+    """
+    target = Path(path) if path is not None else default_env_path()
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    out: dict[str, str] = {}
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if key:
+            out[key] = _unquote(value)
+    return out
 
 
 def _format_line(key: str, value: str) -> str:
@@ -68,4 +102,35 @@ def update_env_file(updates: dict[str, str], path: str | Path | None = None) -> 
             out.append(_format_line(key, value))
 
     target.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return target
+
+
+def delete_env_keys(keys: list[str] | set[str], path: str | Path | None = None) -> Path:
+    """Drop ``keys`` from the ``.env`` at ``path``, leaving everything else.
+
+    ``update_env_file`` deliberately skips empty values (never write a blank
+    credential), so clearing a key from the /setup dashboard needs its own
+    line-removal pass. Comments and unrelated keys are preserved.
+    """
+    target = Path(path) if path is not None else default_env_path()
+    drop = {k for k in keys if k}
+    if not drop:
+        return target
+    try:
+        existing = target.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, NotADirectoryError):
+        return target
+
+    out: list[str] = []
+    for line in existing:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if key in drop:
+                continue
+        out.append(line)
+
+    target.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
     return target

@@ -28,6 +28,8 @@ Client → bridge commands (one JSON object per stdin line)::
     {"type": "tree", "node": "..."?}          # render the session tree / branch
     {"type": "resume", "session_id": "..."?}  # list old sessions / resume one
     {"type": "describe"}
+    {"type": "env_list"}                      # /setup: current keys (masked)
+    {"type": "env_set", "key": ..., "value": ...}  # write/clear a key in .env
     {"type": "quit"}
 
 Bridge → client events (one JSON object per stdout line)::
@@ -53,6 +55,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -62,6 +65,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from koda import env_file, mcp_auth, mcp_config, session_store
 from koda.agent_api import (
     Done,
     PermissionRequest,
@@ -72,15 +76,185 @@ from koda.agent_api import (
     Usage,
     describe_agent,
 )
-from koda import session_store
+from koda.modes import Mode
 from koda.subagent_tasks import BackgroundTaskRegistry
 from koda.tools import permissions as _perms
-from koda.modes import Mode
 
 _log = logging.getLogger("koda.bridge")
 
 # Cap on inlined @file attachment size, so a huge file can't blow the context.
 _MAX_ATTACH_BYTES = 200_000
+
+# Cap on a single tool_result's output sent over the stdio bridge, in chars.
+# The agent's own context already offloads oversized results to
+# ``large_tool_results/`` files (deepagents); the UI only needs a preview, so we
+# truncate here to keep each NDJSON line small. Without this, one giant tool
+# result (a binary dump, an unpaginated read_file, …) becomes a single
+# multi-MB stdout line that the Node/Ink client has to buffer and JSON.parse in
+# one shot — which is what drove the V8 heap OOM.
+_MAX_TOOL_OUTPUT_CHARS = 50_000
+
+
+# Keys the /setup dashboard can show and write: (key, label, secret, hint).
+# `secret` values are masked on the wire; non-secrets (host, flags, default
+# model) are shown verbatim because the user needs to read them back.
+SETUP_KEYS: list[tuple[str, str, bool, str]] = [
+    ("ANTHROPIC_API_KEY", "Anthropic (Claude) API key", True, "sk-ant-…"),
+    ("OPENAI_API_KEY", "OpenAI API key", True, "sk-…"),
+    ("GOOGLE_API_KEY", "Google (Gemini) API key", True, "AIza…"),
+    ("OLLAMA_API_KEY", "Ollama Cloud API key", True, "ollama cloud token"),
+    ("OLLAMA_HOST", "Ollama daemon URL (local/self-hosted)", False, "http://localhost:11434"),
+    ("OLLAMA_USE_CLOUD", "Route Ollama calls to the cloud (1 = yes)", False, "1"),
+    ("TAVILY_API_KEY", "Tavily key (web_search tool)", True, "tvly-…"),
+    ("KODA_DEFAULT_MODEL", "Model used at launch", False, "provider:model"),
+]
+
+
+def _mask_secret(value: str) -> str:
+    """Show enough of a token to recognise it, never enough to reuse it."""
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "•" * len(value)
+    return f"{value[:4]}{'•' * 6}{value[-4:]}"
+
+
+#: Statuses the UI knows how to render, plus the aliases models actually emit.
+_TODO_STATUS = {
+    "pending": "pending",
+    "todo": "pending",
+    "not_started": "pending",
+    "in_progress": "in_progress",
+    "in-progress": "in_progress",
+    "active": "in_progress",
+    "doing": "in_progress",
+    "started": "in_progress",
+    "completed": "completed",
+    "complete": "completed",
+    "done": "completed",
+    "finished": "completed",
+}
+
+
+def _normalize_todos(raw: Any, _depth: int = 0) -> list[dict[str, str]]:
+    """Coerce a ``write_todos`` argument into ``[{content, status}, …]``.
+
+    The tool schema says ``todos`` is a list of objects, but that is not what
+    always arrives. Ollama-family models (and any provider that round-trips
+    tool arguments through a string) hand back the nested array **as a JSON
+    string**, and smaller models invent status names. Emitting that verbatim
+    put a string on the wire where the client's ``Todo[]`` was declared, so
+    ``item.todos.filter`` threw inside Ink's render and killed the whole
+    session over a checklist.
+
+    Anything unrecognisable degrades to ``[]`` — a missing checklist is a
+    cosmetic loss; an exception in the renderer is not.
+    """
+    if _depth > 3:
+        return []
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            return _normalize_todos(json.loads(text), _depth + 1)
+        except (json.JSONDecodeError, ValueError):
+            _log.warning("write_todos: could not parse todos string %r", text[:120])
+            return []
+    if isinstance(raw, dict):
+        # Either a wrapper ({"todos": [...]}) or a single todo object.
+        for key in ("todos", "items", "tasks"):
+            if key in raw:
+                return _normalize_todos(raw[key], _depth + 1)
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        _log.warning("write_todos: unexpected todos payload of type %s", type(raw).__name__)
+        return []
+
+    out: list[dict[str, str]] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            content, status = entry.strip(), "pending"
+        elif isinstance(entry, dict):
+            content = str(
+                entry.get("content") or entry.get("task") or entry.get("title") or entry.get("text") or ""
+            ).strip()
+            status = _TODO_STATUS.get(str(entry.get("status", "")).strip().lower(), "pending")
+        else:
+            continue
+        if content:
+            out.append({"content": content, "status": status})
+    return out
+
+
+#: Ceilings for ``ask_user`` options — the card renders them as a picker, so a
+#: model that returns fifty options or a 10 KB one would wreck the layout.
+_MAX_OPTIONS = 8
+_MAX_OPTION_CHARS = 120
+
+
+def _normalize_options(raw: Any) -> list[str]:
+    """Coerce an ``ask_user`` ``options`` argument into a list of short strings.
+
+    Same untrusted-shape problem as ``_normalize_todos``: this comes straight
+    from the model's tool call. Two concrete hazards here —
+
+      * ``list("yes")`` (the previous code) explodes a string into
+        ``["y", "e", "s"]``, so a model answering with a bare string got three
+        nonsense options.
+      * a non-string entry (dict, number) reaches the client and Ink renders it
+        as a React child, which throws "Objects are not valid as a React
+        child" and kills the session.
+
+    A string is treated as one option rather than a character sequence.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    elif isinstance(raw, dict):
+        # {"a": "...", "b": "..."} — the values are the choices.
+        raw = list(raw.values())
+    elif not isinstance(raw, (list, tuple, set)):
+        _log.warning("ask_user: unexpected options payload of type %s", type(raw).__name__)
+        return []
+
+    out: list[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            entry = entry.get("label") or entry.get("value") or entry.get("text") or ""
+        if entry is None:
+            # Skip rather than coerce: str(None) is "None", which would render
+            # as a selectable option reading literally "None".
+            continue
+        text = " ".join(str(entry).split())[:_MAX_OPTION_CHARS].strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= _MAX_OPTIONS:
+            break
+    return out
+
+
+def _cap_output(output: str) -> str:
+    """Truncate a tool result for the wire, keeping a tail marker.
+
+    Keeps the head plus a note of how many chars were dropped so the user can
+    see what happened (and that more exists on the agent side). Non-str inputs
+    are stringified so the contract stays ``output: str``.
+    """
+    if not isinstance(output, str):
+        output = str(output)
+    if len(output) <= _MAX_TOOL_OUTPUT_CHARS:
+        return output
+    keep = _MAX_TOOL_OUTPUT_CHARS - 200
+    dropped = len(output) - _MAX_TOOL_OUTPUT_CHARS
+    return (
+        f"{output[:keep]}\n"
+        f"… [output truncated: {dropped} more chars dropped for the UI — "
+        f"full result stays in the agent's context] …"
+    )
 
 
 # ── stdout: emit one JSON event per line ────────────────────────────────
@@ -118,7 +292,7 @@ def _event_to_json(ev: Any) -> dict[str, Any] | None:
         return {
             "type": "tool_result",
             "tool_id": ev.tool_id,
-            "output": ev.output,
+            "output": _cap_output(ev.output),
             "is_error": ev.is_error,
         }
     if isinstance(ev, Usage):
@@ -347,7 +521,12 @@ class Bridge:
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._ask_future = fut
         self._loop.call_soon_threadsafe(
-            emit, {"type": "ask_user", "question": question, "options": list(options or [])}
+            emit,
+            {
+                "type": "ask_user",
+                "question": " ".join(str(question or "").split())[:400],
+                "options": _normalize_options(options),
+            },
         )
         try:
             return str(fut.result(timeout=600))
@@ -459,7 +638,42 @@ class Bridge:
                 f"Use check_async_task('{task.id}') for the full output.</task-notification>"
             )
 
+    def _report_mcp_failures(self) -> None:
+        """Tell the user which MCP servers didn't come up on the last build.
+
+        Servers are loaded independently now (``coding_agent.mcp``), so a dead
+        one costs only its own tools. That also makes it easy to miss: without
+        this, a server that failed to connect is invisible outside the log, and
+        the user just silently doesn't have its tools. Reported once per build.
+        """
+        try:
+            from coding_agent.mcp import last_load_report
+
+            report = last_load_report()
+        except Exception:
+            return
+        for entry in report:
+            if entry.get("ok"):
+                continue
+            name = entry.get("name", "?")
+            if entry.get("needs_auth"):
+                emit(
+                    {
+                        "type": "info",
+                        "message": f"MCP '{name}' is not signed in — its tools are unavailable. "
+                        f"Run /mcp and press o to authorize.",
+                    }
+                )
+            else:
+                emit(
+                    {
+                        "type": "info",
+                        "message": f"MCP '{name}' unavailable: {entry.get('error') or 'failed to connect'}",
+                    }
+                )
+
     def _emit_ready(self) -> None:
+        self._report_mcp_failures()
         desc = describe_agent(self._adapter)
         emit(
             {
@@ -478,10 +692,8 @@ class Bridge:
 
     async def aclose(self) -> None:
         if self._registry is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._registry.aclose()
-            except Exception:
-                pass
             try:
                 from koda import subagent_tools
 
@@ -494,16 +706,12 @@ class Bridge:
             _ask.set_hook(None)
         except Exception:
             pass
-        try:
+        with contextlib.suppress(Exception):
             _perms.set_prompt_hook(None)
-        except Exception:
-            pass
         aclose = getattr(self._adapter, "aclose", None)
         if aclose is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await aclose()
-            except Exception:
-                pass
 
     # ── stdin reader (immediate control) ─────────────────────────────
 
@@ -554,10 +762,32 @@ class Bridge:
         if ctype in ("task_stop", "task_resume", "task_restart", "task_answer", "task_list"):
             self._task_control(cmd)
             return
+        # ── MCP / permission dashboard (immediate: read-only or on-loop) ─
+        if ctype == "mcp_list":
+            self._mcp_list()
+            return
+        if ctype == "mcp_test":
+            asyncio.create_task(self._mcp_test(cmd.get("name", "")))
+            return
+        if ctype == "mcp_tools":
+            asyncio.create_task(
+                self._mcp_tools(str(cmd.get("name") or ""), bool(cmd.get("refresh")))
+            )
+            return
+        if ctype == "perms_list":
+            self._perms_list()
+            return
+        if ctype == "env_list":
+            self._env_list()
+            return
+        if ctype == "perms_clear_allowed":
+            _perms.clear_session_allow()
+            self._perms_list()
+            emit({"type": "info", "message": "cleared all session permission grants"})
+            return
         if ctype == "quit":
             self._stop.set()
             return
-
         # ── ordered (queue behind the current turn) ──────────────────
         await self._cmd_queue.put(cmd)
 
@@ -594,7 +824,7 @@ class Bridge:
         while not self._stop.is_set():
             try:
                 cmd = await asyncio.wait_for(self._cmd_queue.get(), timeout=0.25)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             ctype = cmd.get("type")
             try:
@@ -614,6 +844,18 @@ class Bridge:
                     self._emit_ready()
                 elif ctype == "skill":
                     await self._skill(cmd)
+                elif ctype == "mcp_add":
+                    await self._mcp_add(cmd)
+                elif ctype == "mcp_remove":
+                    await self._mcp_remove(cmd)
+                elif ctype == "mcp_set_tool_perm":
+                    await self._mcp_set_tool_perm(cmd)
+                elif ctype == "mcp_authorize":
+                    await self._mcp_authorize(cmd)
+                elif ctype == "mcp_sign_out":
+                    await self._mcp_sign_out(cmd)
+                elif ctype == "env_set":
+                    await self._env_set(cmd)
                 else:
                     emit({"type": "error", "message": f"unknown command: {ctype}"})
             except Exception as e:  # never let one command kill the worker
@@ -732,7 +974,7 @@ class Bridge:
                 if isinstance(ev, ToolStart) and ev.name == "write_todos":
                     # Route todo snapshots to a dedicated event (compact
                     # inline checklist on the client), like the Textual UI.
-                    emit({"type": "todos", "todos": ev.arguments.get("todos", [])})
+                    emit({"type": "todos", "todos": _normalize_todos(ev.arguments.get("todos"))})
                     emit(
                         {
                             "type": "tool_start",
@@ -827,6 +1069,384 @@ class Bridge:
         _perms.set_mode(target)
         emit({"type": "mode_changed", "mode": target.value})
 
+    async def _rebuild(self) -> None:
+        """Rebuild the adapter so a config change (e.g. .mcp.json) takes effect.
+
+        MCP tools are bound at graph compile time (``coding_agent/agent.py``
+        → ``create_deep_agent``), so adding/removing a server requires a
+        fresh graph — the same pattern ``_switch_model`` / ``_clear`` use:
+        build a new adapter via the factory, ``_ensure_graph()``, mark the
+        rebuilt adapter seeded (checkpoint already holds the transcript),
+        and close the old one. Preserves the current model + thread id.
+        """
+        if self._interrupted:
+            emit({"type": "info", "message": "rebuild cancelled (interrupted)"})
+            return
+        old = self._adapter
+        # Build the new adapter in a local first — don't swap self._adapter
+        # until _ensure_graph() succeeds, so that an interrupt during the
+        # build still targets the old (working) adapter.
+        new_adapter = self._factory(model=self._model, thread_id=self._thread_id)
+        try:
+            ensure = getattr(new_adapter, "_ensure_graph", None)
+            if ensure is not None:
+                # Poll the interrupt flag every 100ms so Ctrl+C cancels
+                # quickly instead of blocking for the full 30s MCP timeout.
+                build_task = asyncio.ensure_future(ensure())
+                while not build_task.done():
+                    if self._interrupted:
+                        build_task.cancel()
+                        emit({"type": "info", "message": "rebuild cancelled (interrupted)"})
+                        return
+                    await asyncio.sleep(0.1)
+                build_task.result()  # propagate any exception
+        except Exception as e:
+            emit({"type": "error", "message": f"rebuild failed: {e}"})
+            return
+        if self._interrupted:
+            emit({"type": "info", "message": "rebuild cancelled (interrupted)"})
+            return
+        self._adapter = new_adapter
+        mark = getattr(self._adapter, "mark_seeded", None)
+        if callable(mark):
+            mark()
+        if old is not None:
+            aclose = getattr(old, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+
+    # ── MCP dashboard (/mcp) ────────────────────────────────────────
+
+    def _mcp_list(self) -> None:
+        """Emit the current MCP server config (read from .mcp.json)."""
+        try:
+            servers = mcp_config.read_servers()
+        except Exception as e:
+            emit({"type": "error", "message": f"mcp list failed: {e}"})
+            return
+        emit({"type": "mcp_servers", "servers": servers})
+
+    async def _mcp_test(self, name: str) -> None:
+        """Connect to one server and report its tools (or the failure)."""
+        name = (name or "").strip()
+        if not name:
+            emit({"type": "mcp_status", "name": "", "ok": False, "error": "no server name"})
+            return
+        emit({"type": "info", "message": f"testing '{name}'…"})
+        try:
+            result = await asyncio.wait_for(mcp_config.test_server(name), timeout=30)
+        except TimeoutError:
+            result = {"name": name, "ok": False, "error": "timeout (30s)"}
+        except Exception as e:
+            result = {"name": name, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        emit({"type": "mcp_status", **result})
+
+    async def _mcp_tools(self, name: str, refresh: bool) -> dict[str, Any]:
+        """Emit one server's tools + per-tool policy for the dashboard."""
+        name = name.strip()
+        if not name:
+            emit({"type": "error", "message": "mcp tools: 'name' is required"})
+            return {}
+        try:
+            result = await asyncio.wait_for(mcp_config.list_tools(name, refresh), timeout=35)
+        except TimeoutError:
+            result = {
+                "server": name,
+                "tools": [],
+                "permissions": {},
+                "error": "timeout (35s)",
+            }
+        except Exception as e:
+            result = {
+                "server": name,
+                "tools": [],
+                "permissions": {},
+                "error": f"{type(e).__name__}: {e}",
+            }
+        emit({"type": "mcp_tools", **result})
+        if refresh and not result.get("error"):
+            # A live listing may have discovered new tools; re-emit the server
+            # list so the summary line picks up the freshly cached names.
+            self._mcp_list()
+        return result
+
+    async def _mcp_set_tool_perm(self, cmd: dict[str, Any]) -> None:
+        """Persist one tool's allow/ask/deny policy and re-gate the agent.
+
+        ``tool: "*"`` applies the policy to every tool the server exposes.
+        The graph binds ``interrupt_on`` at compile time, so flipping a tool
+        between ``allow`` and ``ask``/``deny`` needs a rebuild to take effect
+        — same as adding or removing a server.
+        """
+        server = str(cmd.get("server") or "").strip()
+        tool = str(cmd.get("tool") or "").strip()
+        policy = str(cmd.get("policy") or "").strip()
+        if not server or not tool:
+            emit({"type": "error", "message": "mcp permission: 'server' and 'tool' are required"})
+            return
+        if policy not in mcp_config.POLICIES:
+            emit({"type": "error", "message": f"mcp permission: unknown policy {policy!r}"})
+            return
+        if not mcp_config.set_tool_permission(server, tool, policy):
+            emit({"type": "error", "message": f"mcp permission: '{server}' not in .mcp.json"})
+            return
+        _perms.set_mcp_policy(mcp_config.tool_permissions())
+        label = "every tool" if tool == "*" else tool
+        emit({"type": "info", "message": f"{server}: {label} → {policy}"})
+        # Push the new state to the dashboard first so the row updates
+        # immediately; the rebuild behind it can take a few seconds.
+        await self._mcp_tools(server, False)
+        self._mcp_list()
+        await self._rebuild()
+
+    async def _mcp_authorize(self, cmd: dict[str, Any]) -> None:
+        """Sign in to a cloud MCP server in the browser, then rebuild.
+
+        Queued on the worker (not immediate) because it ends in a graph
+        rebuild, and because the flow blocks for as long as the user takes to
+        click through the consent screen — up to five minutes.
+        """
+        name = str(cmd.get("name") or "").strip()
+        if not name:
+            emit({"type": "error", "message": "mcp authorize: 'name' is required"})
+            return
+        emit(
+            {
+                "type": "info",
+                "message": f"authorizing '{name}' — a browser window will open (Ctrl+C to cancel)…",
+            }
+        )
+        self._interrupted = False
+
+        def notify(message: str) -> None:
+            emit({"type": "info", "message": message})
+
+        # The flow waits on a human clicking through a consent screen, which
+        # can take minutes and holds the worker queue the whole time. Run it as
+        # a task and poll the interrupt flag so Ctrl+C gets the user out
+        # instead of wedging the UI until the 5-minute timeout.
+        task = asyncio.ensure_future(mcp_config.authorize_server(name, notify))
+        try:
+            while not task.done():
+                if self._interrupted:
+                    task.cancel()
+                    emit({"type": "info", "message": f"'{name}' sign-in cancelled"})
+                    self._mcp_list()
+                    return
+                await asyncio.sleep(0.1)
+            result = task.result()
+        except asyncio.CancelledError:
+            emit({"type": "info", "message": f"'{name}' sign-in cancelled"})
+            self._mcp_list()
+            return
+        except Exception as e:
+            _log.exception("mcp authorize failed")
+            result = {"name": name, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        emit({"type": "mcp_status", **result})
+        if not result.get("ok"):
+            emit({"type": "error", "message": f"'{name}' sign-in failed: {result.get('error')}"})
+            self._mcp_list()
+            return
+        emit(
+            {
+                "type": "info",
+                "message": f"'{name}' signed in — {result.get('tool_count', 0)} tool(s) available",
+            }
+        )
+        _perms.set_mcp_policy(mcp_config.tool_permissions())
+        await self._mcp_tools(name, False)
+        self._mcp_list()
+        await self._rebuild()
+        self._emit_ready()
+
+    async def _mcp_sign_out(self, cmd: dict[str, Any]) -> None:
+        """Forget a server's stored OAuth tokens and rebuild without them."""
+        name = str(cmd.get("name") or "").strip()
+        servers = {s["name"]: s for s in mcp_config.read_servers()}
+        entry = servers.get(name)
+        if entry is None:
+            emit({"type": "error", "message": f"mcp sign-out: '{name}' not in .mcp.json"})
+            return
+        url = str(entry.get("url") or "")
+        if not url or not mcp_auth.clear_credentials(url):
+            emit({"type": "info", "message": f"'{name}' was not signed in"})
+            self._mcp_list()
+            return
+        emit({"type": "info", "message": f"signed out of '{name}' — rebuilding agent…"})
+        self._mcp_list()
+        await self._rebuild()
+
+    async def _mcp_add(self, cmd: dict[str, Any]) -> None:
+        """Validate + persist a new/updated server, then rebuild the agent."""
+        name = str(cmd.get("name") or "").strip()
+        if not name:
+            emit({"type": "error", "message": "mcp add: 'name' is required"})
+            return
+        spec = self._build_mcp_spec(cmd)
+        try:
+            mcp_config.write_server(name, spec)
+        except ValueError as e:
+            emit({"type": "error", "message": f"mcp add: {e}"})
+            return
+        emit({"type": "info", "message": f"added MCP server '{name}' — connecting…"})
+        # Discover the tools straight away: it verifies the server actually
+        # works *and* fills in the permission list, so the user isn't left
+        # looking at a row that says "tools not listed yet".
+        probe = await self._mcp_tools(name, True)
+        if probe.get("needs_auth"):
+            # A cloud server (Notion, Linear, …) — sign-in is the next step, and
+            # rebuilding now would just fail to connect. Stop and say so.
+            emit(
+                {
+                    "type": "info",
+                    "message": f"'{name}' needs authorization — press o to sign in with your browser",
+                }
+            )
+            self._mcp_list()
+            return
+        _perms.set_mcp_policy(mcp_config.tool_permissions())
+        emit({"type": "info", "message": f"rebuilding agent with '{name}'…"})
+        await self._rebuild()
+        self._mcp_list()
+        self._emit_ready()
+
+    async def _mcp_remove(self, cmd: dict[str, Any]) -> None:
+        """Delete a server from .mcp.json and rebuild the agent."""
+        name = str(cmd.get("name") or "").strip()
+        if not name:
+            emit({"type": "error", "message": "mcp remove: 'name' is required"})
+            return
+        if not mcp_config.remove_server(name):
+            emit({"type": "error", "message": f"mcp remove: '{name}' not in .mcp.json"})
+            return
+        emit({"type": "info", "message": f"removed MCP server '{name}' — rebuilding agent…"})
+        _perms.set_mcp_policy(mcp_config.tool_permissions())
+        await self._rebuild()
+        self._mcp_list()
+        self._emit_ready()
+
+    @staticmethod
+    def _build_mcp_spec(cmd: dict[str, Any]) -> dict[str, Any]:
+        """Turn a dashboard add-form payload into a .mcp.json server spec.
+
+        Accepts the generic user shape: ``transport`` (http|sse|stdio),
+        ``url`` (http/sse) or ``command``+``args`` (stdio), optional
+        ``headers`` / ``env`` (dicts). Drops empty fields so the file
+        stays clean.
+
+        ``default_policy`` (allow|ask|deny) lands in the nested ``koda``
+        block and becomes the starting permission for every tool the server
+        exposes. It defaults to ``ask``: a new server is untrusted code
+        reaching into the user's accounts, so nothing it offers runs
+        unattended until the user says so in the tool list.
+        """
+        transport = str(cmd.get("transport") or "").strip().lower()
+        spec: dict[str, Any] = {"transport": transport}
+        policy = str(cmd.get("default_policy") or "").strip().lower()
+        if transport in ("http", "sse", "streamable-http", "streamable_http"):
+            url = str(cmd.get("url") or "").strip()
+            if url:
+                spec["url"] = url
+            headers = cmd.get("headers")
+            if isinstance(headers, dict) and headers:
+                spec["headers"] = headers
+        elif transport == "stdio":
+            command = str(cmd.get("command") or "").strip()
+            if command:
+                spec["command"] = command
+            args = cmd.get("args")
+            if isinstance(args, list) and args:
+                spec["args"] = args
+            env = cmd.get("env")
+            if isinstance(env, dict) and env:
+                spec["env"] = env
+        # Last, so the standard keys other MCP clients care about read first.
+        spec["koda"] = {
+            "defaultPermission": policy if policy in mcp_config.POLICIES else mcp_config.DEFAULT_POLICY
+        }
+        return spec
+
+    # ── permission dashboard (/perms) ──────────────────────────────
+
+    def _perms_list(self) -> None:
+        """Emit the live permission state for the /perms dashboard."""
+        emit({
+            "type": "perms_state",
+            "mode": _perms.current_mode().value,
+            "auto_approve": _perms.is_auto_approve(),
+            "allowed_tools": _perms.allowed_tools(),
+            "mutating_tools": sorted(_perms.MUTATING_TOOLS),
+            "file_edit_tools": sorted(_perms.FILE_EDIT_TOOLS),
+        })
+
+    # ── setup dashboard (/setup) ────────────────────────────────────
+
+    def _env_list(self) -> None:
+        """Emit the credential/config state for the /setup dashboard.
+
+        Secrets are masked before they cross the wire — the UI only ever needs
+        "is it set, and does it look right", never the full token. ``source``
+        separates ``.env`` (persists across launches) from ``env`` (ambient,
+        gone next shell), which is the distinction users actually get wrong.
+        """
+        try:
+            in_file = env_file.read_env_file()
+        except Exception as e:  # unreadable/odd .env must not kill the dashboard
+            in_file = {}
+            emit({"type": "error", "message": f"setup: could not read .env: {e}"})
+        keys = []
+        for key, label, secret, hint in SETUP_KEYS:
+            file_val = in_file.get(key, "")
+            env_val = os.environ.get(key, "")
+            value = file_val or env_val
+            keys.append({
+                "key": key,
+                "label": label,
+                "secret": secret,
+                "hint": hint,
+                "set": bool(value),
+                "value": _mask_secret(value) if secret else value,
+                "source": ".env" if file_val else ("env" if env_val else ""),
+            })
+        emit({
+            "type": "env_state",
+            "path": str(env_file.default_env_path()),
+            "model": self._model,
+            "keys": keys,
+        })
+
+    async def _env_set(self, cmd: dict[str, Any]) -> None:
+        """Persist one credential/config key to .env, then rebuild the agent.
+
+        An empty value clears the key (removes the .env line and drops it from
+        this process's environment). Only keys in ``SETUP_KEYS`` are writable —
+        the dashboard is a credential editor, not a general env-var shell.
+        """
+        key = str(cmd.get("key") or "").strip()
+        value = str(cmd.get("value") or "").strip()
+        if key not in {k for k, _, _, _ in SETUP_KEYS}:
+            emit({"type": "error", "message": f"setup: '{key}' is not a settable key"})
+            return
+        try:
+            if value:
+                path = env_file.update_env_file({key: value})
+                os.environ[key] = value
+            else:
+                path = env_file.delete_env_keys([key])
+                os.environ.pop(key, None)
+        except Exception as e:
+            emit({"type": "error", "message": f"setup: writing {key} failed: {e}"})
+            return
+        action = "saved" if value else "cleared"
+        emit({"type": "info", "message": f"{action} {key} in {path} — rebuilding agent…"})
+        # Provider clients read their keys at construction time, so a new key
+        # only takes effect on a fresh adapter (same pattern as /mcp add).
+        await self._rebuild()
+        self._env_list()
+        self._emit_ready()
+
     async def _switch_model(self, model_spec: str) -> None:
         model_spec = (model_spec or "").strip()
         if not model_spec:
@@ -855,10 +1475,8 @@ class Bridge:
         if old is not None:
             aclose = getattr(old, "aclose", None)
             if aclose is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await aclose()
-                except Exception:
-                    pass
         emit({"type": "model_changed", "model": self._model})
         self._emit_ready()
 
@@ -901,9 +1519,62 @@ class Bridge:
             lines = lines[:4] + [f"  … {len(lines) - 8} more …"] + lines[-4:]
         return "\n".join(lines)
 
+    def _tree_nodes(self) -> dict:
+        """Structured session tree for the TUI's /tree popup.
+
+        Flat node list with parent pointers + an `active`/`leaf` flag so the
+        client can render the tree, highlight the active path, and let the user
+        jump to any node to branch from there.
+        """
+        tree = self._session
+        active_ids = {e.id for e in tree.get_active_path()}
+        leaf = tree.leaf_id
+        nodes: list[dict] = []
+
+        def walk(parent_id: str | None, depth: int) -> None:
+            children = tree.get_children(parent_id)
+            branching = len(children) > 1
+            for ch in children:
+                d = depth + (1 if branching else 0)
+                if ch.type == "message" and ch.role in ("user", "assistant"):
+                    nodes.append(
+                        {
+                            "id": ch.id,
+                            "parent_id": ch.parent_id,
+                            "depth": d,
+                            "role": ch.role,
+                            "type": ch.type,
+                            "preview": " ".join(ch.content.split())[:64],
+                            "active": ch.id in active_ids,
+                            "leaf": ch.id == leaf,
+                        }
+                    )
+                elif ch.type == "compaction":
+                    nodes.append(
+                        {
+                            "id": ch.id,
+                            "parent_id": ch.parent_id,
+                            "depth": d,
+                            "role": None,
+                            "type": ch.type,
+                            "preview": "compaction",
+                            "active": ch.id in active_ids,
+                            "leaf": ch.id == leaf,
+                        }
+                    )
+                walk(ch.id, d)
+
+        walk(None, 0)
+        return {
+            "session_id": tree.session_id,
+            "message_count": tree.message_count(),
+            "leaf": leaf,
+            "nodes": nodes,
+        }
+
     async def _tree(self, node: str) -> None:
         if not node:
-            emit({"type": "info", "message": self._render_tree()})
+            emit({"type": "tree", **self._tree_nodes()})
             return
         entry = self._session.navigate_to(node.strip())
         if entry is None:
@@ -928,10 +1599,8 @@ class Bridge:
         if old is not None:
             aclose = getattr(old, "aclose", None)
             if aclose is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await aclose()
-                except Exception:
-                    pass
         preview = " ".join(entry.content.split())[:60]
         emit(
             {
@@ -1009,10 +1678,8 @@ class Bridge:
         if old is not None:
             aclose = getattr(old, "aclose", None)
             if aclose is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await aclose()
-                except Exception:
-                    pass
         _perms.clear_session_allow()  # permission grants don't carry across resumes
 
         # Replay the transcript so the UI can re-render the conversation.
@@ -1038,17 +1705,13 @@ class Bridge:
         self._adapter = self._factory(model=self._model, thread_id=self._thread_id)
         ensure = getattr(self._adapter, "_ensure_graph", None)
         if ensure is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await ensure()
-            except Exception:
-                pass
         if old is not None:
             aclose = getattr(old, "aclose", None)
             if aclose is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await aclose()
-                except Exception:
-                    pass
         emit({"type": "cleared"})
         self._emit_ready()
 
@@ -1128,10 +1791,8 @@ def main(argv: list[str] | None = None) -> None:
     factory = _build_adapter_factory(args.agent)
     bridge = Bridge(factory=factory, model=model, thread_id=args.thread)
 
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(bridge.run())
-    except KeyboardInterrupt:
-        pass
 
 
 if __name__ == "__main__":

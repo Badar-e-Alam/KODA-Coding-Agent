@@ -45,10 +45,28 @@ def set_workspace_root(root: str | Path) -> None:
 def _resolve(p: str) -> Path:
     """Resolve a model-supplied path to a real filesystem path inside the jail.
 
-    '/foo/bar'  -> {root}/foo/bar
-    'foo/bar'   -> {root}/foo/bar
+    '/foo/bar'          -> {root}/foo/bar
+    'foo/bar'           -> {root}/foo/bar
+    '{root}/foo/bar'    -> {root}/foo/bar
+
+    The third form matters: models routinely echo back the real absolute path
+    they saw in the prompt or in shell output (``/Users/me/proj/koda/x.py``).
+    Treating that as jail-relative turned it into ``{root}/Users/me/proj/…``
+    and failed with "not found", so the agent burned several calls rediscovering
+    the path convention. Stripping the root prefix makes both spellings work;
+    paths genuinely outside the root are still rejected below.
     """
-    raw = p.lstrip("/").replace("\\", "/") if p.startswith("/") else p
+    raw = p.replace("\\", "/")
+    if raw.startswith("/"):
+        root_str = str(_ROOT)
+        if raw == root_str:
+            raw = ""
+        elif raw.startswith(root_str + "/"):
+            raw = raw[len(root_str) + 1:]
+        else:
+            raw = raw.lstrip("/")
+    else:
+        raw = p
     candidate = _ROOT / raw
     # Reject symlinks along the path — resolve() would follow them out of the jail.
     probe = candidate
@@ -258,10 +276,7 @@ def grep(
         return f"Error: path not found: {path}"
 
     files_to_scan: list[Path]
-    if base.is_file():
-        files_to_scan = [base]
-    else:
-        files_to_scan = [p for p in base.rglob("*") if p.is_file()]
+    files_to_scan = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
     if glob:
         files_to_scan = [p for p in files_to_scan if fnmatch.fnmatch(p.name, glob)]
 
