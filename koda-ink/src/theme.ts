@@ -58,6 +58,17 @@ export const THEMES: Record<string, Palette> = {
     error: "#dc322f",
     muted: "#586e75",
   },
+  opencode: {
+    primary: "#fdfcfc",
+    accent: "#f4a261",
+    assistant: "#e6e1dc",
+    user: "#7ee787",
+    tool: "#f4a261",
+    toolOk: "#56d4dd",
+    toolErr: "#ff7b72",
+    error: "#ff7b72",
+    muted: "#8b8680",
+  },
 };
 
 export const DEFAULT_THEME = "koda";

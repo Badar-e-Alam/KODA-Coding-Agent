@@ -24,7 +24,7 @@ export interface CompleteResult {
 export const COMMANDS: Array<[string, string]> = [
   ["clear", "start a new chat session"],
   ["model", "[provider:model] — switch model or show current"],
-  ["setup", "add/change API keys and pick a client"],
+  ["setup", "API-key dashboard — add/change/clear keys (writes .env)"],
   ["tree", "[id] — show the session tree, or jump to a node to branch"],
   ["resume", "[id] — pick a past session and continue it"],
   ["skill", "[new <name>: <what>] — list skills, or author one with the model"],
@@ -36,19 +36,24 @@ export const COMMANDS: Array<[string, string]> = [
   ["tools", "list the active agent's tools"],
   ["tasks", "list background subagent tasks"],
   ["dashboard", "open the full-screen subagent dashboard"],
+  ["mcp", "manage MCP servers (add/remove/test cloud servers)"],
+  ["perms", "permission dashboard (mode, allowed tools, grants)"],
   ["task", "<id> stop|resume|restart|result — control a subagent"],
   ["plan", "switch to plan mode (advisory, no writes/shell)"],
   ["edits", "switch to accept-edits mode"],
   ["default", "switch back to default mode"],
   ["help", "list all slash commands"],
-  ["quit", "exit KODA"],
-  ["exit", "exit KODA"],
+  ["quit", "exit"],
+  ["exit", "exit"],
 ];
 
 // The bridge sends the model list on `ready`; we cache it here for completion.
 let MODELS: string[] = [];
 export function setModels(models: string[]): void {
   MODELS = models;
+}
+export function getModels(): string[] {
+  return MODELS;
 }
 
 let FILES: string[] | null = null;

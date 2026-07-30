@@ -11,9 +11,22 @@ interface Props {
 
 // Inline prompt for the agent's ask_user tool. With options: ↑/↓ + Enter picks
 // one; typing switches to free-text. Without options: free-text only.
-export function AskUser({ question, options, palette, onAnswer }: Props) {
+export function AskUser({ question, options: rawOptions, palette, onAnswer }: Props) {
   const [sel, setSel] = useState(0);
   const [text, setText] = useState("");
+  // `options` comes from the model's own tool call, so the declared string[] is
+  // a hope, not a guarantee. A non-string entry rendered as a React child
+  // throws ("Objects are not valid as a React child") and takes the session
+  // down. The bridge normalizes this too; this is the render-side backstop.
+  const options = React.useMemo(
+    () =>
+      (Array.isArray(rawOptions) ? rawOptions : [])
+        .map((o) => (typeof o === "string" ? o : String(o ?? "")))
+        .map((o) => o.trim())
+        .filter(Boolean),
+    [rawOptions],
+  );
+  const safeQuestion = typeof question === "string" ? question : String(question ?? "");
   const freeText = text.length > 0 || options.length === 0;
 
   useInput((input, key) => {
@@ -21,7 +34,7 @@ export function AskUser({ question, options, palette, onAnswer }: Props) {
       if (freeText) {
         if (text.trim()) onAnswer(text.trim());
       } else {
-        onAnswer(options[sel]);
+        onAnswer(options[Math.min(sel, options.length - 1)] ?? "");
       }
       return;
     }
@@ -51,7 +64,7 @@ export function AskUser({ question, options, palette, onAnswer }: Props) {
       <Text color={palette.accent} bold>
         The agent has a question
       </Text>
-      <Text color={palette.assistant}>{question}</Text>
+      <Text color={palette.assistant}>{safeQuestion}</Text>
       {options.length > 0 ? (
         <Box flexDirection="column" marginTop={1}>
           {options.map((o, i) => (

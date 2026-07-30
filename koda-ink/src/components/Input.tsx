@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import type { Palette } from "../theme.js";
 import { styleFor, type Mode } from "../modes.js";
@@ -327,7 +327,7 @@ export function Input({ active, palette, mode, streaming, onSubmit, onInterrupt,
             <Text color={symbolColor} bold>
               {symbol}{" "}
             </Text>
-            <Text color={palette.muted}>Ask KODA anything…  (/ commands · @ files · ! shell)</Text>
+            <Text color={palette.muted}>Message…  (/ commands · @ files · ! shell)</Text>
           </Box>
         ) : (
           visible.map((rowText, i) => {

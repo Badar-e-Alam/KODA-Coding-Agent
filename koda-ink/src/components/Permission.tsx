@@ -17,6 +17,42 @@ const OPTIONS: Array<{ key: "allow" | "always" | "deny"; label: string }> = [
   { key: "deny", label: "Deny" },
 ];
 
+const MAXW = 96;
+
+function truncate(s: string, n = MAXW): string {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/** Concise one-liner describing WHAT the gated call does. */
+function summarizeAction(item: PermissionItem): string {
+  const a = item.args || {};
+  const fp = (a.file_path as string) || (a.path as string) || "";
+  switch (item.tool_name) {
+    case "write_file":
+      return fp ? `write file ${fp}` : "write file";
+    case "edit_file": {
+      const oldS = String(a.old_string ?? "");
+      const clip = oldS.split("\n")[0].trim();
+      return fp
+        ? `edit ${fp}${clip ? ` — "${truncate(clip, 48)}"` : ""}`
+        : "edit file";
+    }
+    case "multi_edit": {
+      const n = Array.isArray(a.edits) ? a.edits.length : 0;
+      return fp
+        ? `edit ${fp}${n ? ` (${n} change${n === 1 ? "" : "s"})` : ""}`
+        : "edit file";
+    }
+    case "execute":
+    case "bash_background": {
+      const c = String(a.command ?? "");
+      return c ? `run: ${truncate(c)}` : "run command";
+    }
+    default:
+      return (item.description as string) || item.tool_name || "tool call";
+  }
+}
+
 export function Permission({ item, index, total, palette, onDecide }: Props) {
   const [sel, setSel] = useState(0);
 
@@ -34,6 +70,9 @@ export function Permission({ item, index, total, palette, onDecide }: Props) {
     <Box flexDirection="column" borderStyle="round" borderColor={palette.accent} paddingX={1} marginTop={1}>
       <Text color={palette.accent} bold>
         Permission required {total > 1 ? `(${index + 1}/${total})` : ""}
+      </Text>
+      <Text color={palette.accent} bold>
+        {summarizeAction(item)}
       </Text>
       <Text color={palette.assistant}>
         Tool: <Text bold>{item.tool_name}</Text>

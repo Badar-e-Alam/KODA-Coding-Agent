@@ -89,7 +89,9 @@ export function TaskDetail({
 }) {
   const col = STATE_COLOR[t.state](palette);
   const running = isActive(t.state);
-  const activity = t.activity ?? [];
+  // Optional wire field: `?? []` covers absent, Array.isArray covers a
+  // wrong-typed payload. `.slice`/`.map` below would throw on a string.
+  const activity = Array.isArray(t.activity) ? t.activity : [];
 
   // Result (only shown once finished) gets a few lines; the rest of the
   // vertical space is the scrollable activity log, anchored to the tail.
@@ -269,7 +271,7 @@ export function Dashboard({ tasks, palette, rows, onClose, onControl }: Props) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={palette.accent} paddingX={1}>
       <Text color={palette.primary} bold>
-        KODA · Background subagents ({tasks.length})
+        Subagents ({tasks.length})
       </Text>
       <Text color={palette.muted}>
         <Hint k="↑/↓" label="select agent" palette={palette} />

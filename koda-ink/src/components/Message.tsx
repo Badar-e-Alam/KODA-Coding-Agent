@@ -10,23 +10,120 @@ const TODO_GLYPH: Record<Todo["status"], string> = {
   completed: "✓",
 };
 
-function formatArgs(args: Record<string, unknown>): string {
-  const keys = Object.keys(args ?? {});
-  if (keys.length === 0) return "";
-  const pairs: string[] = [];
-  for (const k of keys) {
-    let v = args[k];
-    if (typeof v === "string" && v.length > 40) v = v.slice(0, 37) + "…";
-    let s: string;
-    try {
-      s = typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v);
-    } catch {
-      s = String(v);
-    }
-    pairs.push(`${k}=${s}`);
+// ── tool call rendering ──────────────────────────────────────────────
+// One tool call = one header line ("what am I doing, to what") plus one
+// indented result line ("what came of it"). We deliberately do NOT dump the
+// whole kwargs map: a header like
+//   grep(-n="true", output_mode="content", path="/koda-ink/src", pattern="mcp…
+// costs a full terminal row and says less than `Grep(mcp_list)`. Each tool
+// declares its display verb and its ONE meaningful argument; everything else
+// is noise the transcript doesn't need.
+const TOOL_VERBS: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Update",
+  multi_edit: "Update",
+  execute: "Bash",
+  bash_background: "Bash",
+  bash_output: "BashOutput",
+  kill_bash: "KillBash",
+  grep: "Grep",
+  glob: "Glob",
+  ls: "List",
+  git: "Git",
+  git_diff: "Diff",
+  run_tests: "Tests",
+  run_lint: "Lint",
+  run_type_check: "Typecheck",
+  web_search: "WebSearch",
+  web_fetch: "Fetch",
+  visual_analyze: "Analyze",
+  ask_user: "Ask",
+  think: "Think",
+  write_todos: "Todos",
+};
+
+// Which argument names carry the "what" of a call, most specific first.
+const TARGET_KEYS = [
+  "file_path", "command", "pattern", "url", "query", "subcommand", "extra_args",
+  "thought", "question", "path", "checker", "framework", "linter", "bash_id",
+];
+
+function toolVerb(name: string): string {
+  return TOOL_VERBS[name] ?? name;
+}
+
+// Trim absolute/virtual paths down to project-relative: the leading
+// /Users/…/project (or the tools' virtual "/" root) is the same on
+// every line, so it only steals width from the part that differs.
+function prettyPath(p: string): string {
+  const cwd = process.cwd();
+  if (p.startsWith(cwd)) p = p.slice(cwd.length);
+  return p.replace(/^\/+/, "") || ".";
+}
+
+function toolTarget(item: Extract<Item, { kind: "tool" }>): string {
+  const args = item.args ?? {};
+  // `git` splits one command across two args — show it the way you'd type it.
+  if (item.name === "git" && typeof args.subcommand === "string") {
+    return clip(`${args.subcommand} ${str(args.extra_args)}`.trim(), 68);
   }
-  const joined = pairs.join(", ");
-  return joined.length <= 80 ? joined : joined.slice(0, 79) + "…";
+  for (const k of TARGET_KEYS) {
+    const v = args[k];
+    if (typeof v !== "string" || !v.trim()) continue;
+    const value = k === "file_path" || k === "path" ? prettyPath(v) : v;
+    return clip(value, 68);
+  }
+  return "";
+}
+
+function lineCount(s: unknown): number {
+  const t = typeof s === "string" ? s : "";
+  if (!t) return 0;
+  return t.replace(/\n$/, "").split("\n").length;
+}
+
+function plural(n: number, one: string, many = one + "s"): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+// The result line. Per-tool metrics (lines added/removed, matches found, lines
+// read) beat a raw output preview — they're what the reader is checking for,
+// and they fit in a few words instead of a wrapped blob.
+function toolDetail(item: Extract<Item, { kind: "tool" }>): string {
+  const out = item.output ?? "";
+  const args = item.args ?? {};
+  switch (item.name) {
+    case "edit_file": {
+      const added = lineCount(args.new_string);
+      const removed = lineCount(args.old_string);
+      if (added || removed) return `Added ${plural(added, "line")}, removed ${plural(removed, "line")}`;
+      break;
+    }
+    case "multi_edit": {
+      const edits = Array.isArray(args.edits) ? args.edits.length : 0;
+      if (edits) return `Applied ${plural(edits, "edit")}`;
+      break;
+    }
+    case "write_file": {
+      const n = lineCount(args.content);
+      if (n) return `Wrote ${plural(n, "line")}`;
+      break;
+    }
+    case "read_file":
+      return `Read ${plural(lineCount(out), "line")}`;
+    case "grep": {
+      if (/^\(no (matches|content matches)/.test(out)) return "No matches";
+      const mode = String(args.output_mode ?? "");
+      const n = lineCount(out);
+      return mode === "files_with_matches" ? `${plural(n, "file")} matched` : `${plural(n, "match", "matches")}`;
+    }
+    case "glob":
+      return /^\(no files match/.test(out) ? "No files found" : `${plural(lineCount(out), "file")}`;
+    case "ls":
+      return /^\(empty directory/.test(out) ? "Empty" : `${plural(lineCount(out), "entry", "entries")}`;
+  }
+  return preview(out);
 }
 
 function preview(text: string): string {
@@ -109,7 +206,17 @@ function SubagentCard({
   );
 }
 
-export function MessageView({ item, palette }: { item: Item; palette: Palette }) {
+export function MessageView({
+  item,
+  palette,
+  prevKind,
+}: {
+  item: Item;
+  palette: Palette;
+  // Kind of the item directly above, so consecutive tool calls can pack
+  // together instead of each opening with a blank line.
+  prevKind?: Item["kind"];
+}) {
   switch (item.kind) {
     case "user":
       return (
@@ -136,52 +243,66 @@ export function MessageView({ item, palette }: { item: Item; palette: Palette })
 
       const headColor = item.isError ? palette.toolErr : item.running ? palette.tool : palette.toolOk;
       const glyph = item.running ? "◐" : item.isError ? "✗" : "●";
-      const args = formatArgs(item.args);
+      const target = toolTarget(item);
       return (
-        <Box flexDirection="column" marginTop={1}>
+        // A run of tool calls is one block: no blank line between them, so ten
+        // calls cost ten rows instead of twenty.
+        <Box flexDirection="column" marginTop={prevKind === "tool" ? 0 : 1}>
           <Text color={headColor}>
-            {glyph} {item.name}
-            {args ? `(${args})` : ""}
+            {glyph} <Text bold>{toolVerb(item.name)}</Text>
+            {target ? `(${target})` : ""}
           </Text>
           {item.running ? (
             <Text color={palette.muted}> ↳ …</Text>
           ) : (
-            <Text color={item.isError ? palette.toolErr : palette.muted}> ↳ {preview(item.output ?? "")}</Text>
+            <Text color={item.isError ? palette.toolErr : palette.muted}>
+              {" ↳ "}
+              {item.isError ? preview(item.output ?? "") : toolDetail(item)}
+            </Text>
           )}
         </Box>
       );
     }
 
     case "todos": {
-      const done = item.todos.filter((t) => t.status === "completed").length;
+      // Never trust the shape here. This component also renders items restored
+      // from a past session, which may predate the normalization upstream, and
+      // an exception in a render kills the entire UI — so a malformed payload
+      // renders as nothing rather than taking the session with it.
+      const todos = Array.isArray(item.todos) ? item.todos : [];
+      if (todos.length === 0) return null;
+      const done = todos.filter((t) => t?.status === "completed").length;
       return (
         <Box flexDirection="column" marginTop={1}>
           <Text bold color={palette.primary}>
             Tasks{" "}
             <Text color={palette.muted}>
-              ({done}/{item.todos.length})
+              ({done}/{todos.length})
             </Text>
           </Text>
-          {item.todos.map((t, i) => {
-            const g = TODO_GLYPH[t.status] ?? "○";
-            if (t.status === "completed")
+          {todos.map((t, i) => {
+            const g = TODO_GLYPH[t?.status] ?? "○";
+            // Coerce before rendering: an object here is a React child, and
+            // "Objects are not valid as a React child" escapes the render.
+            const text = typeof t?.content === "string" ? t.content : String(t?.content ?? "");
+            if (t?.status === "completed")
               return (
                 <Text key={i} color={palette.muted} strikethrough>
                   {"  "}
-                  {g} {t.content}
+                  {g} {text}
                 </Text>
               );
-            if (t.status === "in_progress")
+            if (t?.status === "in_progress")
               return (
                 <Text key={i} bold color={palette.accent}>
                   {"  "}
-                  {g} {t.content}
+                  {g} {text}
                 </Text>
               );
             return (
               <Text key={i} color={palette.assistant}>
                 {"  "}
-                {g} {t.content}
+                {g} {text}
               </Text>
             );
           })}

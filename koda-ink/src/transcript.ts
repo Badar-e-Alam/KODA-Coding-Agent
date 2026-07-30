@@ -26,6 +26,18 @@ export interface TState {
 // stays well under any realistic terminal height.
 const LIVE_ASSIST_CAP = 5;
 
+// Defense-in-depth: even if the bridge ever sends a large tool output, cap the
+// copy we retain in React state (and thus in <Static>'s retained element tree)
+// so a very long session can't grow the V8 heap without bound. The bridge
+// already truncates to ~50k chars; this is the client-side backstop.
+const MAX_RETAINED_OUTPUT = 50_000;
+
+function capOutput(s: string | undefined): string | undefined {
+  if (s === undefined) return s;
+  if (s.length <= MAX_RETAINED_OUTPUT) return s;
+  return s.slice(0, MAX_RETAINED_OUTPUT - 80) + `\n… [${s.length - MAX_RETAINED_OUTPUT} more chars truncated for the UI] …`;
+}
+
 let counter = 0;
 export function nextId(): string {
   counter += 1;
@@ -54,6 +66,45 @@ function flushFinalPrefix(state: TState): TState {
     committed.push(item as Item);
   }
   return moved ? { committed, live } : state;
+}
+
+const TODO_STATUSES = new Set(["pending", "in_progress", "completed"]);
+
+/** Force any `todos` payload into a real `Todo[]`, dropping what it can't read.
+ *
+ * Providers that round-trip tool arguments through a string (the Ollama family
+ * does) deliver the nested array as JSON text, and small models invent status
+ * names. Rendering that raw threw `item.todos.filter is not a function` and
+ * killed the session, so nothing downstream is allowed to assume the shape.
+ */
+export function normalizeTodos(raw: unknown): Todo[] {
+  let value = raw;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (value && !Array.isArray(value) && typeof value === "object") {
+    const wrapped = (value as Record<string, unknown>).todos;
+    value = Array.isArray(wrapped) ? wrapped : [value];
+  }
+  if (!Array.isArray(value)) return [];
+  const out: Todo[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string") {
+      if (entry.trim()) out.push({ content: entry.trim(), status: "pending" });
+      continue;
+    }
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const content = String(e.content ?? e.task ?? e.title ?? e.text ?? "").trim();
+    if (!content) continue;
+    const s = String(e.status ?? "").trim().toLowerCase();
+    out.push({ content, status: (TODO_STATUSES.has(s) ? s : "pending") as Todo["status"] });
+  }
+  return out;
 }
 
 // Finalize the trailing "soft" block (streaming assistant or in-place todos) so
@@ -161,7 +212,7 @@ export function transcriptReducer(state: TState, action: TAction): TState {
         if (action.is_error) {
           const live = [
             ...state.live,
-            { kind: "error" as const, id: nextId(), text: humanizeError(action.output), final: true },
+            { kind: "error" as const, id: nextId(), text: humanizeError(capOutput(action.output) ?? ""), final: true },
           ];
           return flushFinalPrefix({ ...state, live });
         }
@@ -169,22 +220,28 @@ export function transcriptReducer(state: TState, action: TAction): TState {
       }
       const live = state.live.map((it) =>
         it.kind === "tool" && it.toolId === action.tool_id
-          ? { ...it, output: action.output, isError: action.is_error, running: false, final: true }
+          ? { ...it, output: capOutput(action.output), isError: action.is_error, running: false, final: true }
           : it,
       );
       return flushFinalPrefix({ ...state, live });
     }
 
     case "todos": {
+      // Coerce at the boundary. The bridge normalizes this too, but the
+      // reducer is the single funnel every todos item passes through (live
+      // events today, resumed sessions tomorrow), and a non-array here throws
+      // inside Ink's render — which takes down the whole session over a
+      // checklist. See `normalizeTodos`.
+      const todos = normalizeTodos(action.todos);
       const last = state.live[state.live.length - 1];
       if (last && last.kind === "todos" && !last.final) {
         const live = state.live.slice();
-        live[live.length - 1] = { ...last, todos: action.todos };
+        live[live.length - 1] = { ...last, todos };
         return { ...state, live };
       }
       const live = [
         ...finalizeSoftTail(state.live),
-        { kind: "todos" as const, id: nextId(), todos: action.todos, final: false },
+        { kind: "todos" as const, id: nextId(), todos, final: false },
       ];
       return flushFinalPrefix({ ...state, live });
     }
