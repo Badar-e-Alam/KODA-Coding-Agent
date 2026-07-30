@@ -34,7 +34,6 @@ const DIM = "\x1b[2m";
 export interface BannerInfo {
   version: string;
   model: string;
-  cwd: string;
   mode: string;
   palette: Palette;
   color: boolean;
@@ -49,25 +48,12 @@ export function bannerString(info: BannerInfo): string {
   const primary = c(palette.primary);
   const muted = c(palette.muted);
 
-  const home = info.cwd.replace(process.env.HOME ?? "~", "~");
-  const meta = [
-    `${muted}model  ${reset}${accent}${info.model}${reset}`,
-    `${muted}cwd    ${reset}${home}`,
-  ];
-  // Only surface the mode when it's not the plain default — the DEFAULT line is
-  // noise; accept-edits / plan modes are worth calling out.
-  if (info.mode && info.mode.toLowerCase() !== "default") {
-    meta.push(`${muted}mode   ${reset}${info.mode.toUpperCase()}`);
-  }
-
   const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
   const lines: string[] = [""];
-  ART.forEach((row, i) => {
-    const right = meta[i - 1] ?? (i === 0 ? `${primary}KODA · AI coding agent  v${info.version}${reset}` : "");
-    lines.push(`${accent}${row}${reset}${right ? "     " + right : ""}`);
-  });
+  for (const row of ART) {
+    lines.push(`${accent}${row}${reset}`);
+  }
   lines.push("");
-  lines.push(`  ${muted}Your AI teammate, right in the terminal.${reset}`);
   lines.push(`  ${dim}Tip: ${tip}${reset}`);
   lines.push(`  ${dim}/help for commands · @ files · ! shell · Ctrl+C to interrupt${reset}`);
   lines.push("");

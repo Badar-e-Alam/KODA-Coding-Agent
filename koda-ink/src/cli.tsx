@@ -28,7 +28,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--continue" || a === "-c") args.resume = "latest";
     else if (a === "--help" || a === "-h") {
       process.stdout.write(
-        "koda-ink — inline terminal UI for KODA\n\n" +
+        "koda-ink — inline terminal UI\n\n" +
           "  --model, -m        provider:model (e.g. anthropic:claude-sonnet-4-6)\n" +
           "  --agent, -a        agent backend (default: coding_agent)\n" +
           "  --cwd,   -C        project directory to operate on\n" +
@@ -60,8 +60,7 @@ function main() {
   process.stdout.write(
     bannerString({
       version: VERSION,
-      model: args.model ?? "auto-detecting…",
-      cwd: process.cwd(),
+      model: args.model ?? "…",
       mode: "default",
       palette,
       color,
