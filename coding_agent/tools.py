@@ -405,6 +405,56 @@ _GIT_READ_ONLY_SUBCOMMANDS = frozenset({
     "shortlog", "reflog", "config",  # config is read-only when invoked with --get*
 })
 
+# Flags that make an otherwise whitelisted subcommand change the repo.
+_GIT_MUTATING_FLAGS = {
+    "branch": {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+               "-f", "--force", "-u", "--set-upstream-to", "--unset-upstream",
+               "--edit-description", "-t", "--track", "--no-track"},
+    "tag": {"-d", "--delete", "-a", "--annotate", "-s", "--sign", "-u", "--local-user",
+            "-f", "--force", "-m", "--message", "-F", "--file", "-e", "--edit"},
+    "config": {"--unset", "--unset-all", "--add", "--replace-all", "--rename-section",
+               "--remove-section", "-e", "--edit"},
+}
+# Flags that put ``branch`` / ``tag`` in list mode, where positionals are patterns.
+_GIT_LIST_MODE_FLAGS = {
+    "-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+    "--verify", "-n", "--contains", "--no-contains", "--merged", "--no-merged",
+    "--points-at", "--show-current",
+}
+_GIT_CONFIG_READ_FLAGS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch",
+                          "-l", "--list", "--get-color", "--get-colorbool"}
+
+
+def _git_mutation_reason(sc: str, args: list[str]) -> str | None:
+    """Return why ``git <sc> <args>`` could write, or None when it is read-only."""
+    flags = {a.split("=", 1)[0] for a in args if a.startswith("-")}
+    positionals = [a for a in args if not a.startswith("-")]
+    # git accepts bundled short options (``-vD`` = ``-v -D``) and unique
+    # prefixes of long options (``--del`` = ``--delete``); normalise both.
+    for f in list(flags):
+        if not f.startswith("--") and len(f) > 2:
+            flags.update(f"-{c}" for c in f[1:])
+    mutating = _GIT_MUTATING_FLAGS.get(sc, set()) | {"--output"}
+    for f in list(flags):
+        if f.startswith("--") and len(f) > 2:
+            flags.update(m for m in mutating if m.startswith("--") and m.startswith(f))
+    if "--output" in flags:
+        return "--output writes a file"
+    bad = flags & mutating
+    if bad:
+        return f"{sorted(bad)[0]} changes the repository"
+    if sc in ("branch", "tag") and positionals and not flags & _GIT_LIST_MODE_FLAGS:
+        return f"`git {sc} <name>` creates a {sc}; use --list to filter"
+    if sc == "remote" and positionals and positionals[0] not in ("show", "get-url"):
+        return f"`git remote {positionals[0]}` changes the remotes"
+    if sc == "reflog" and positionals and positionals[0] in ("expire", "delete"):
+        return f"`git reflog {positionals[0]}` deletes reflog entries"
+    if sc == "config" and not flags & _GIT_CONFIG_READ_FLAGS and (
+        not positionals or positionals[0] not in ("get", "list")
+    ):
+        return "config is allowed only with --get*/--list (or `config get` / `config list`)"
+    return None
+
 
 @tool
 def git(subcommand: str, extra_args: str = "", path: str = ".") -> str:
@@ -445,6 +495,12 @@ def git(subcommand: str, extra_args: str = "", path: str = ".") -> str:
     # so quoted values like ``--pretty=format:'%h %s'`` survive intact.
     import shlex
     parts = [sc, *shlex.split(extra_args)] if extra_args else [sc]
+    reason = _git_mutation_reason(sc, parts[1:])
+    if reason:
+        return (
+            f"[error] refusing `git {' '.join(parts)}`: {reason}. This tool is read-only; "
+            "for mutating commands, use the `execute` tool with explicit intent."
+        )
     return _git(parts, cwd=path)
 
 
@@ -818,10 +874,17 @@ class _BackgroundProc:
         self._chars = 0
         self._dropped = False
         self._lock = threading.Lock()
+        self._readers: list[threading.Thread] = []
         for stream, prefix in ((proc.stdout, ""), (proc.stderr, "[stderr] ")):
             if stream is not None:
                 t = threading.Thread(target=self._pump, args=(stream, prefix), daemon=True)
                 t.start()
+                self._readers.append(t)
+
+    def join_readers(self, timeout: float = 2.0) -> None:
+        """Wait for the reader threads to reach EOF, so no final output is lost."""
+        for t in self._readers:
+            t.join(timeout)
 
     def _pump(self, stream, prefix: str) -> None:
         """Forward a stream line-by-line into the buffer until EOF."""
@@ -860,12 +923,24 @@ class _BackgroundProc:
         rc = self.proc.poll()
         return "running" if rc is None else f"exited (code {rc})"
 
-    def terminate(self) -> None:
-        """SIGTERM then SIGKILL the whole process group."""
+    def group_alive(self) -> bool:
+        """True while any process is left in the command's process group."""
         try:
-            pgid = os.getpgid(self.proc.pid)
+            os.killpg(self.proc.pid, 0)
         except ProcessLookupError:
-            return
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def terminate(self) -> None:
+        """SIGTERM then SIGKILL the whole process group.
+
+        ``start_new_session=True`` makes the shell's pid the group id, so the
+        group is signalled even after the shell itself has exited and been
+        reaped — its children may still be running.
+        """
+        pgid = self.proc.pid
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(pgid, sig)
@@ -873,9 +948,10 @@ class _BackgroundProc:
                 return
             try:
                 self.proc.wait(timeout=3)
-                return
             except subprocess.TimeoutExpired:
                 continue
+            if not self.group_alive():
+                return
 
 
 def _cleanup_background_procs() -> None:
@@ -969,13 +1045,20 @@ def bash_output(bash_id: str) -> str:
     if bp is None:
         known = ", ".join(sorted(_BG_PROCS)) or "(none)"
         return f"[error] unknown bash_id {bash_id!r}. Active: {known}"
-    new_output = bp.drain()
     status = bp.status()
+    # Keep the id while children of the shell still run, so kill_bash can
+    # still reap them.
+    finished = status.startswith("exited") and not bp.group_alive()
+    if finished:
+        # The process can exit before the reader threads have buffered its
+        # last lines; wait for them, or that output is lost with the id.
+        bp.join_readers()
+    new_output = bp.drain()
     header = f"bash_id={bash_id} status={status}\ncommand: {bp.command}"
     body = new_output if new_output else "(no new output)"
     # Once the process has exited and its final output has been delivered,
     # drop it from the registry so the id list stays meaningful.
-    if status.startswith("exited"):
+    if finished:
         with _BG_LOCK:
             _BG_PROCS.pop(bash_id, None)
     return f"{header}\n--new output--\n{body}"
