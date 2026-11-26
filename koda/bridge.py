@@ -30,6 +30,7 @@ Client → bridge commands (one JSON object per stdin line)::
     {"type": "describe"}
     {"type": "env_list"}                      # /setup: current keys (masked)
     {"type": "env_set", "key": ..., "value": ...}  # write/clear a key in .env
+    {"type": "tool_stats"}                    # session tool-call totals (immediate)
     {"type": "quit"}
 
 Bridge → client events (one JSON object per stdout line)::
@@ -44,6 +45,15 @@ Bridge → client events (one JSON object per stdout line)::
     {"type": "permission_request", "items": [{"tool_name", "args",
                                               "allowed_decisions", "description"}]}
     {"type": "done", "usage": {...}|null}
+    {"type": "tool_stats", "scope": "turn"|"session", "calls": int,
+     "errors": int, "unfinished": [name, ...], "orphan_results": int,
+     "by_tool": {name: {"calls", "errors", "total_ms", "max_ms",
+                        "output_chars"}},
+     "repeats": [{"name", "arguments", "count"}]}
+        # scope "turn": sent once per turn, right before turn_end; counts every
+        #   ToolStart/ToolResult of the turn, the hidden write_todos included.
+        # scope "session": the answer to the tool_stats command; running total
+        #   since launch, reset by clear and by resuming a session.
     {"type": "turn_end", "reply": "..."}              # turn fully finished
     {"type": "model_changed", "model": ...}
     {"type": "info", "message": "..."}
@@ -78,6 +88,7 @@ from koda.agent_api import (
 )
 from koda.modes import Mode
 from koda.subagent_tasks import BackgroundTaskRegistry
+from koda.tool_stats import ToolCallTracker
 from koda.tools import permissions as _perms
 
 _log = logging.getLogger("koda.bridge")
@@ -469,6 +480,10 @@ class Bridge:
         # a Future that the stdin reader resolves when the client answers.
         self._ask_future: concurrent.futures.Future | None = None
         self._hook_future: concurrent.futures.Future | None = None
+        # Tool-call analysis: one tracker per turn (reset each turn) and a
+        # running session total (reset on clear / resume).
+        self._turn_tools = ToolCallTracker()
+        self._session_tools = ToolCallTracker()
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -780,6 +795,9 @@ class Bridge:
         if ctype == "env_list":
             self._env_list()
             return
+        if ctype == "tool_stats":
+            self._emit_tool_stats("session")
+            return
         if ctype == "perms_clear_allowed":
             _perms.clear_session_allow()
             self._perms_list()
@@ -949,8 +967,33 @@ class Bridge:
 
     # ── a single user turn ───────────────────────────────────────────
 
+    def _track_tool_event(self, ev: Any) -> None:
+        """Feed a ToolStart/ToolResult into the turn and session trackers.
+
+        Uses the real arguments and the full output (not the capped wire
+        copy). Never raises: stats must not break a turn."""
+        try:
+            for tracker in (self._turn_tools, self._session_tools):
+                if isinstance(ev, ToolStart):
+                    tracker.start(ev.tool_id, ev.name, ev.arguments)
+                elif isinstance(ev, ToolResult):
+                    tracker.finish(ev.tool_id, ev.output, ev.is_error)
+        except Exception:
+            _log.debug("tool stats tracking failed", exc_info=True)
+
+    def _emit_tool_stats(self, scope: str) -> None:
+        tracker = self._turn_tools if scope == "turn" else self._session_tools
+        try:
+            summary = tracker.summary()
+            emit({"type": "tool_stats", "scope": scope, **summary})
+        except Exception:
+            # e.g. circular repeats[].arguments: stats must never block turn_end.
+            _log.debug("tool stats emit failed", exc_info=True)
+
     async def _run_turn(self, text: str) -> None:
+        self._turn_tools.reset()
         if not text.strip() and not self._pending_task_notes:
+            self._emit_tool_stats("turn")
             emit({"type": "turn_end", "reply": ""})
             return
         # Inject any finished-task notifications ahead of the user's message so
@@ -971,6 +1014,8 @@ class Bridge:
         self._turn_task = asyncio.current_task()
         try:
             async for ev in self._adapter.stream(expanded, self._history[:-1]):
+                if isinstance(ev, (ToolStart, ToolResult)):
+                    self._track_tool_event(ev)
                 if isinstance(ev, ToolStart) and ev.name == "write_todos":
                     # Route todo snapshots to a dedicated event (compact
                     # inline checklist on the client), like the Textual UI.
@@ -1017,6 +1062,7 @@ class Bridge:
                 self._session.add_message("assistant", reply)
             except Exception:
                 _log.debug("session write failed", exc_info=True)
+        self._emit_tool_stats("turn")
         emit({"type": "turn_end", "reply": reply})
 
     # ── permission decisions ─────────────────────────────────────────
@@ -1681,6 +1727,7 @@ class Bridge:
                 with contextlib.suppress(Exception):
                     await aclose()
         _perms.clear_session_allow()  # permission grants don't carry across resumes
+        self._session_tools.reset()  # tool stats are per session
 
         # Replay the transcript so the UI can re-render the conversation.
         emit(
@@ -1697,6 +1744,7 @@ class Bridge:
 
     async def _clear(self) -> None:
         self._history.clear()
+        self._session_tools.reset()
         _perms.clear_session_allow()
         # Fresh branchable session file + a matching fresh checkpoint thread.
         self._session = session_store.new_session()
