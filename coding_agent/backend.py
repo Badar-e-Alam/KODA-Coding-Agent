@@ -46,6 +46,8 @@ from deepagents.backends import (
 )
 from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
 
+from coding_agent.sandbox import wrap_command
+
 # Skills ship with the package so the agent always has them available,
 # regardless of which project directory it was launched in.
 SKILLS_DIR = Path(__file__).parent / "skills"
@@ -82,10 +84,13 @@ class ReapingShellBackend(LocalShellBackend):
             msg = f"timeout must be positive, got {effective_timeout}"
             raise ValueError(msg)
 
+        # KODA_SANDBOX=project wraps the command in bwrap/sandbox-exec (argv
+        # list, shell=False); off returns it unchanged for shell=True.
+        wrapped = wrap_command(command, root=str(self.cwd))
         try:
             proc = subprocess.Popen(  # noqa: S602
-                command,
-                shell=True,  # Intentional: LLM-controlled shell execution.
+                wrapped.args,
+                shell=wrapped.shell,  # Intentional: LLM-controlled shell execution.
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -131,6 +136,8 @@ class ReapingShellBackend(LocalShellBackend):
             stderr_lines = stderr.strip().split("\n")
             output_parts.extend(f"[stderr] {line}" for line in stderr_lines)
         output = "\n".join(output_parts) if output_parts else "<no output>"
+        if wrapped.warning:
+            output = f"[sandbox] {wrapped.warning}\n{output}"
 
         truncated = False
         if len(output) > self._max_output_bytes:

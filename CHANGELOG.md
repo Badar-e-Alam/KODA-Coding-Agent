@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `KODA_SANDBOX=project` runs `execute` and `bash_background` under
+  `sandbox-exec` (macOS) or bubblewrap (Linux): writes limited to the project
+  and temp, network off unless `KODA_SANDBOX_NETWORK=1`. Default stays `off`.
+  A missing or unusable sandbox tool falls back to unsandboxed execution with a
+  one-time warning.
+
+### Fixed
+- README no longer claims shell tools are jailed; it now states exactly what
+  is and is not limited.
+
 ## [0.4.0] - 2026-04-18
 
 ### Added

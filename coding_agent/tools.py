@@ -29,6 +29,8 @@ from langchain_core.tools import tool
 from pydantic import BaseModel
 from tavily import TavilyClient
 
+from coding_agent.sandbox import wrap_command
+
 
 class FindReplace(BaseModel):
     """One find/replace operation for `multi_edit`."""
@@ -926,9 +928,12 @@ def bash_background(command: str, path: str = ".") -> str:
         return "[error] command must be a non-empty string"
     global _BG_COUNTER
     try:
+        # Same isolation as ``execute`` when KODA_SANDBOX=project; the
+        # project root is the process cwd KODA was launched in.
+        wrapped = wrap_command(command, root=os.getcwd(), cwd=path)
         proc = subprocess.Popen(  # noqa: S602
-            command,
-            shell=True,
+            wrapped.args,
+            shell=wrapped.shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -944,7 +949,8 @@ def bash_background(command: str, path: str = ".") -> str:
         _BG_COUNTER += 1
         bash_id = f"bg_{_BG_COUNTER}"
         _BG_PROCS[bash_id] = _BackgroundProc(bash_id, command, proc)
-    return f"started bash_id={bash_id} pid={proc.pid}: {command}"
+    started = f"started bash_id={bash_id} pid={proc.pid}: {command}"
+    return f"[sandbox] {wrapped.warning}\n{started}" if wrapped.warning else started
 
 
 @tool
