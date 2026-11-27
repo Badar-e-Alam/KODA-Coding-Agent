@@ -119,8 +119,20 @@ class PermissionRequest:
     items: list[PermissionItem]
 
 
+@dataclass
+class Notice:
+    """Informational event from the adapter layer (retry/fallback status).
+
+    ``retry_in`` is the backoff delay in seconds when this notice announces
+    a retry; ``None`` for other notices (e.g. a fallback-model switch).
+    """
+
+    message: str
+    retry_in: float | None = None
+
+
 AgentEvent = Union[
-    TextDelta, ThinkingDelta, ToolStart, ToolResult, Usage, Done, PermissionRequest
+    TextDelta, ThinkingDelta, ToolStart, ToolResult, Usage, Done, PermissionRequest, Notice
 ]
 
 

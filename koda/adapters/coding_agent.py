@@ -63,6 +63,14 @@ class CodingAgentAdapter(LangGraphAdapter):
             _log.debug("building coding_agent graph for model=%s", self._model)
             self._graph = await build_agent(model=self._model)
 
+    async def _use_model(self, model: str) -> None:
+        """Rebuild the graph on the new model; same thread_id keeps history."""
+        async with self._graph_build_lock:
+            self._model = model
+            self._graph = None
+        await self._ensure_graph()
+        self.mark_seeded()
+
     async def compact(self) -> CompactionResult:
         """Summarize older turns for this thread (the ``/compact`` command).
 

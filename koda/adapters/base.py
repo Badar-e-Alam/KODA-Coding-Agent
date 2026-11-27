@@ -33,10 +33,13 @@ from koda.agent_api import (
     AgentEvent,
     Done,
     KodaAgent,
+    Notice,
     ToolDescription,
     ToolResult,
     Usage,
 )
+
+from koda.reliability import MAX_ATTEMPTS, backoff_delay, classify, fallback_model
 
 _log = logging.getLogger("koda.adapters.base")
 
@@ -114,23 +117,125 @@ class BaseAdapter(KodaAgent):
         capability flags, or a system-prompt preview."""
         return AgentDescription(name=self._model, backend=self._backend)
 
+    async def _use_model(self, model: str) -> None:
+        """Point the adapter at ``model`` (fallback switch / restore).
+
+        Default just rebinds the name, which suffices for adapters that
+        read ``self._model`` on every call. Adapters holding a compiled
+        graph or client override this to rebuild it.
+        """
+        self._model = model
+
+    async def _backoff_sleep(self, delay: float) -> bool:
+        """Sleep ``delay`` seconds; returns True if cancelled meanwhile.
+
+        Waits on the cancel event so Ctrl+C interrupts a backoff at once.
+        """
+        try:
+            await asyncio.wait_for(self._cancel.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
     async def stream(
         self, message: str, history: list[dict[str, Any]]
     ) -> AsyncIterator[AgentEvent]:
-        """Run one turn end-to-end. Emits events, cleans up cancel state,
-        always yields a final ``Done``.
+        """Run one turn end-to-end, with retry + fallback around the native call.
+
+        Transient failures (429/529/overloaded/connection reset) are retried
+        with exponential backoff (``MAX_ATTEMPTS`` tries, honouring
+        Retry-After), announcing each as a ``Notice``. Retries only happen
+        when the failed attempt had not yet emitted any event, so output and
+        tool calls are never duplicated; a mid-stream failure is surfaced as
+        an error as before. Once retries are exhausted, ``KODA_FALLBACK_MODEL``
+        (if set) is used for the rest of the turn; the primary model is
+        restored at the start of the next turn. Always yields a final ``Done``.
+        """
+        self._cancel.clear()
+        if getattr(self, "_primary_model", None) is None:
+            self._primary_model = self._model
+        if self._model != self._primary_model:
+            await self._use_model(self._primary_model)  # new turn: undo last fallback
+        usage = Usage()
+        state = {"emitted": False}
+        attempt = 0
+        on_fallback = False
+
+        while True:
+            state["emitted"] = False
+            try:
+                async for ev in self._stream_attempt(message, history, usage, state):
+                    yield ev
+                break
+            except asyncio.CancelledError:
+                _log.info("%s stream cancelled", type(self).__name__)
+                raise
+            except Exception as e:
+                retryable, retry_after = classify(e)
+                if retryable and not state["emitted"] and not self._cancel.is_set():
+                    attempt += 1
+                    if attempt < MAX_ATTEMPTS:
+                        delay = backoff_delay(attempt, retry_after)
+                        yield Notice(
+                            message=f"retrying in {delay:.0f}s ({type(e).__name__}, attempt {attempt + 1}/{MAX_ATTEMPTS})",
+                            retry_in=delay,
+                        )
+                        if await self._backoff_sleep(delay):
+                            break
+                        continue
+                    fb = fallback_model()
+                    if fb and not on_fallback and fb != self._model:
+                        try:
+                            await self._use_model(fb)
+                        except Exception as fe:
+                            _log.exception("fallback model switch failed")
+                            yield ToolResult(
+                                tool_id="adapter_error",
+                                output=f"Agent error: {type(e).__name__}: {e} (fallback model {fb} unavailable: {fe})",
+                                is_error=True,
+                            )
+                            break
+                        on_fallback = True
+                        attempt = 0
+                        yield Notice(
+                            message=f"{type(e).__name__} persisted after {MAX_ATTEMPTS} attempts; "
+                            f"using fallback model {fb} for the rest of this turn"
+                        )
+                        continue
+                    hint = "" if fb else " (set KODA_FALLBACK_MODEL to fall back to another model)"
+                    _log.exception("%s stream failed after retries", type(self).__name__)
+                    yield ToolResult(
+                        tool_id="adapter_error",
+                        output=f"Agent error: {type(e).__name__}: {e} — gave up after {MAX_ATTEMPTS} attempts{hint}",
+                        is_error=True,
+                    )
+                    break
+                _log.exception("%s stream failed", type(self).__name__)
+                yield ToolResult(
+                    tool_id="adapter_error",
+                    output=f"Agent error: {type(e).__name__}: {e}",
+                    is_error=True,
+                )
+                break
+
+        yield Done(usage=Usage(**usage.__dict__) if _has_usage(usage) else None)
+
+    async def _stream_attempt(
+        self,
+        message: str,
+        history: list[dict[str, Any]],
+        usage: Usage,
+        state: dict[str, bool],
+    ) -> AsyncIterator[AgentEvent]:
+        """One pass over the native stream. Raises on SDK errors; sets
+        ``state["emitted"]`` once any event has been yielded.
 
         The chunk loop is built around ``asyncio.wait`` so the cancel
         signal interrupts a stalled stream within ~50 ms instead of
         waiting for the next ``__anext__`` to resolve. Without this,
         Ctrl+C looks dead during slow LLM responses or long tool
-        executions because ``async for`` blocks on the awaitable from
-        the native stream and never re-enters the loop body to see
-        ``self._cancel.is_set()``.
+        executions.
         """
-        self._cancel.clear()
-        usage = Usage()
-
         stream_iter = self._native_stream(message, history).__aiter__()
         try:
             while True:
@@ -183,19 +288,10 @@ class BaseAdapter(KodaAgent):
                     for ev in produced:
                         if isinstance(ev, Usage):
                             merge_usage(usage, ev)
+                        state["emitted"] = True
                         yield ev
         except asyncio.CancelledError:
-            _log.info("%s stream cancelled", type(self).__name__)
             raise
-        except Exception as e:
-            _log.exception("%s stream failed", type(self).__name__)
-            yield ToolResult(
-                tool_id="adapter_error",
-                output=f"Agent error: {type(e).__name__}: {e}",
-                is_error=True,
-            )
-
-        yield Done(usage=Usage(**usage.__dict__) if _has_usage(usage) else None)
 
     # ── Subclass contract ────────────────────────────────────────────
 

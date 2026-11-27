@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -383,5 +384,66 @@ def _eligible_providers() -> list[str]:
             continue
         out.append(name)
     return out
+
+
+# ── Price table (cost reporting) ──────────────────────────────────────
+#
+# Kept apart from model discovery above. USD per million tokens, published
+# list prices; ``cache_read`` / ``cache_write`` are ``None`` where there is
+# no separate cache price (cache tokens are then priced at the input rate).
+# Only models with a known price belong here: lookups are EXACT (after
+# normalising provider prefix and date suffix), and an unknown model yields
+# ``None`` — never a guessed or zero price.
+
+@dataclass(frozen=True)
+class ModelPrice:
+    input: float
+    output: float
+    cache_read: float | None = None
+    cache_write: float | None = None
+
+
+PRICES: dict[str, ModelPrice] = {
+    "claude-opus-4-5": ModelPrice(5.0, 25.0, 0.50, 6.25),
+    "claude-opus-4-1": ModelPrice(15.0, 75.0, 1.50, 18.75),
+    "claude-opus-4": ModelPrice(15.0, 75.0, 1.50, 18.75),
+    "claude-sonnet-4-5": ModelPrice(3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4": ModelPrice(3.0, 15.0, 0.30, 3.75),
+    "claude-haiku-4-5": ModelPrice(1.0, 5.0, 0.10, 1.25),
+    "claude-3-5-haiku": ModelPrice(0.80, 4.0, 0.08, 1.0),
+    "gpt-4o": ModelPrice(2.50, 10.0, 1.25),
+    "gpt-4o-mini": ModelPrice(0.15, 0.60, 0.075),
+}
+
+_DATE_SUFFIX = re.compile(r"(-\d{8}|-\d{4}-\d{2}-\d{2}|-latest)$")
+
+
+def price_for(model: str | None) -> ModelPrice | None:
+    """Price entry for ``model`` or ``None`` when unknown.
+
+    Accepts ``provider:model`` / ``provider/model`` forms and dated
+    suffixes (``claude-sonnet-4-20250514``). Never prefix-matches, so a new
+    model (``claude-opus-4-7``) is unknown rather than priced like an
+    older sibling.
+    """
+    name = (model or "").strip().lower()
+    if not name:
+        return None
+    name = re.split(r"[:/]", name)[-1]
+    return PRICES.get(name) or PRICES.get(_DATE_SUFFIX.sub("", name))
+
+
+def cost_usd(model: str | None, usage: Any) -> float | None:
+    """Dollar cost of one ``Usage`` snapshot, or ``None`` if the model is unpriced."""
+    pr = price_for(model)
+    if pr is None or usage is None:
+        return None
+    inp = getattr(usage, "input_tokens", 0) or 0
+    out = getattr(usage, "output_tokens", 0) or 0
+    cr = getattr(usage, "cache_read_tokens", 0) or 0
+    cw = getattr(usage, "cache_write_tokens", 0) or 0
+    cr_rate = pr.cache_read if pr.cache_read is not None else pr.input
+    cw_rate = pr.cache_write if pr.cache_write is not None else pr.input
+    return (inp * pr.input + out * pr.output + cr * cr_rate + cw * cw_rate) / 1_000_000
 
 
