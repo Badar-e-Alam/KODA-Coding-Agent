@@ -90,6 +90,21 @@ def _resolve(p: str) -> Path:
     return full
 
 
+def _within_root(p: Path) -> bool:
+    """True if a path found by rglob is a real (non-symlink) entry inside the jail.
+
+    rglob does not go through ``_resolve``: a pattern such as ``../*`` walks out
+    of the base, and a symlinked file would let grep read its target.
+    """
+    if p.is_symlink():
+        return False
+    try:
+        p.resolve().relative_to(_ROOT)
+    except ValueError:
+        return False
+    return True
+
+
 def _rel(p: Path) -> str:
     """Format a real path as a model-visible absolute path."""
     try:
@@ -247,7 +262,9 @@ def glob(pattern: str, path: str = "/") -> str:
     base = _resolve(path)
     if not base.exists() or not base.is_dir():
         return f"Error: base path not a directory: {path}"
-    matches = [p for p in base.rglob(pattern.lstrip("/")) if p.is_file()]
+    matches = [
+        p for p in base.rglob(pattern.lstrip("/")) if p.is_file() and _within_root(p)
+    ]
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if not matches:
         return f"(no files match {pattern!r} under {path})"
@@ -276,7 +293,9 @@ def grep(
         return f"Error: path not found: {path}"
 
     files_to_scan: list[Path]
-    files_to_scan = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
+    files_to_scan = [base] if base.is_file() else [
+        p for p in base.rglob("*") if p.is_file() and _within_root(p)
+    ]
     if glob:
         files_to_scan = [p for p in files_to_scan if fnmatch.fnmatch(p.name, glob)]
 
