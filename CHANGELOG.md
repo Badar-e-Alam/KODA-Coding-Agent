@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- One-shot automation mode: `--output-format json|stream-json`, `--max-turns`, `--max-budget-usd`, and exit codes 0/1/2/3
+
 ## [0.4.0] - 2026-04-18
 
 ### Added
