@@ -4,7 +4,7 @@
 
 **An AI coding agent that lives in your terminal.**
 
-Long‑horizon coding, jailed file/shell tools, background subagents, and a modern
+Long‑horizon coding, project‑jailed file tools, opt‑in shell sandboxing, background subagents, and a modern
 inline TUI — powered by LangGraph + [deepagents](https://github.com/langchain-ai/deepagents),
 model‑agnostic across Anthropic, OpenAI, Google, and Ollama.
 
@@ -39,7 +39,9 @@ so conversations, tool state, and project memory survive restarts.
   and a growing/scrollable input box.
 - 🔌 **Model‑agnostic.** Anthropic · OpenAI · Google · Ollama (local *or* cloud) ·
   any OpenAI‑compatible endpoint. Switch models mid‑session with `/model`.
-- 🔒 **Safe by default.** Filesystem/shell tools are jailed to your project, web
+- 🔒 **Safe by default.** File tools are jailed to your project; shell commands
+  run with your own access unless you set `KODA_SANDBOX=project`
+  ([details](#shell-isolation-koda_sandbox)); web
   search is SSRF‑hardened, and mutating actions pause for your approval
   (`default` → `accept-edits` → `plan` modes, `Shift+Tab` to cycle).
 - 🧩 **Extensible.** Bring your own LangGraph agent, add MCP servers for live docs
@@ -53,7 +55,7 @@ so conversations, tool state, and project memory survive restarts.
 |------|--------------|
 | **Inline UI** | TypeScript + [Ink](https://github.com/vadimdemedes/ink) REPL in your normal scrollback — select/copy, clickable links, slash‑command menu, `@`‑file autocomplete, thinking indicator, live tool rendering |
 | **The agent** | Long‑horizon deepagents/LangGraph loop with todos, a durable SQLite checkpointer, and an organically‑built project knowledge base |
-| **Tools** | Jailed `read_file` / `write_file` / `edit_file` / `ls` / `glob` / `grep` + shell, plus web search/read (SSRF‑guarded) |
+| **Tools** | Project‑jailed `read_file` / `write_file` / `edit_file` / `ls` / `glob` / `grep` + shell (unjailed unless `KODA_SANDBOX=project`), plus web search/read (SSRF‑guarded) |
 | **Subagents** | Blocking `task` specialists (explore / plan / edit) **and** background async subagents with a full‑screen **dashboard** (live status, tokens, tools, and a scrollable activity log) |
 | **Skills** | `/skill new <name>: <what it does>` — the agent authors a reusable [Agent Skill](https://agentskills.io) with the current model; loaded automatically via progressive disclosure |
 | **Sessions** | Branchable JSONL tree (`/tree`), auto markdown transcripts, `/resume` picker, and `koda -r` / `koda -c` at launch |
@@ -228,6 +230,26 @@ Copy `.env.example` → `.env` and set the keys for your provider(s):
 | `JINA_API_KEY` | Web search/read |
 
 `KODA_DEFAULT_MODEL` pins a default so you don't pass `--model` every launch.
+
+### Shell isolation (`KODA_SANDBOX`)
+
+What is and is not limited:
+
+- **File tools** (`read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`) are
+  always limited to the project directory.
+- **Shell commands** (`execute` and `bash_background`) are **not** limited by
+  default (`KODA_SANDBOX=off`). Once you approve one, it runs with your full
+  access to the machine and the network.
+- `KODA_SANDBOX=project` runs those shell commands under `sandbox-exec` (macOS)
+  or `bwrap`/bubblewrap (Linux). They can still **read** anywhere, but can
+  **write** only to the project directory and temp (`/tmp`, `/var/tmp`, `$TMPDIR`),
+  and have **no network** unless you also set `KODA_SANDBOX_NETWORK=1` (needed
+  for package installs, `git push`, and so on).
+- If `KODA_SANDBOX=project` is set but the sandbox tool is missing or cannot run
+  (e.g. bwrap without unprivileged user namespaces), commands run **unsandboxed**
+  and KODA prints a one-time warning saying so.
+- Not covered by the sandbox: the `run_tests`, `type_check`, and `lint` tools,
+  MCP servers, and Windows (no sandbox there).
 
 ---
 
