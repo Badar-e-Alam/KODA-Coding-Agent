@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Model call retries on 429/529/overloaded/connection resets: exponential backoff with jitter, 4 attempts, honouring `Retry-After`; each retry is announced ("retrying in Ns")
+- `KODA_FALLBACK_MODEL`: used for the rest of the turn once retries are exhausted
+- Per-model price table (`koda/provider_models.py`); per-turn cost shown in dollars for known models (unknown models show tokens only)
+- `KODA_SESSION_BUDGET_USD`: refuses new turns once the session cost reaches it
+
 ## [0.4.0] - 2026-04-18
 
 ### Added

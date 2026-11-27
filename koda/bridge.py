@@ -78,6 +78,7 @@ from typing import Any
 from koda import env_file, mcp_auth, mcp_config, session_store
 from koda.agent_api import (
     Done,
+    Notice,
     PermissionRequest,
     TextDelta,
     ThinkingDelta,
@@ -87,6 +88,7 @@ from koda.agent_api import (
     describe_agent,
 )
 from koda.modes import Mode
+from koda.reliability import SessionCost, session_budget_usd
 from koda.subagent_tasks import BackgroundTaskRegistry
 from koda.tool_stats import ToolCallTracker
 from koda.tools import permissions as _perms
@@ -306,6 +308,13 @@ def _event_to_json(ev: Any) -> dict[str, Any] | None:
             "output": _cap_output(ev.output),
             "is_error": ev.is_error,
         }
+    if isinstance(ev, Notice):
+        # Reuse the generic ``info`` event the TUI already renders (koda-ink
+        # can't be edited here); ``retry_in`` is extra data for richer clients.
+        out: dict[str, Any] = {"type": "info", "message": ev.message}
+        if ev.retry_in is not None:
+            out["retry_in"] = round(ev.retry_in, 2)
+        return out
     if isinstance(ev, Usage):
         return {
             "type": "usage",
@@ -484,6 +493,8 @@ class Bridge:
         # running session total (reset on clear / resume).
         self._turn_tools = ToolCallTracker()
         self._session_tools = ToolCallTracker()
+        # Dollar cost per turn, summed from each turn's final Done usage.
+        self._cost = SessionCost()
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -795,6 +806,9 @@ class Bridge:
         if ctype == "env_list":
             self._env_list()
             return
+        if ctype == "usage":
+            emit({"type": "info", "message": self._cost.summary()})
+            return
         if ctype == "tool_stats":
             self._emit_tool_stats("session")
             return
@@ -992,6 +1006,19 @@ class Bridge:
 
     async def _run_turn(self, text: str) -> None:
         self._turn_tools.reset()
+        if self._cost.budget_exceeded():
+            emit(
+                {
+                    "type": "error",
+                    "message": (
+                        f"session budget reached: ${self._cost.usd:.4f} of "
+                        f"${session_budget_usd():.2f} (KODA_SESSION_BUDGET_USD). "
+                        "Raise or unset it to continue."
+                    ),
+                }
+            )
+            emit({"type": "turn_end", "reply": ""})
+            return
         if not text.strip() and not self._pending_task_notes:
             self._emit_tool_stats("turn")
             emit({"type": "turn_end", "reply": ""})
@@ -1035,6 +1062,8 @@ class Bridge:
                 payload = _event_to_json(ev)
                 if payload is not None:
                     emit(payload)
+                if isinstance(ev, Done):
+                    self._record_turn_cost(ev.usage)
                 if isinstance(ev, TextDelta):
                     reply_parts.append(ev.content)
         except asyncio.CancelledError:
@@ -1064,6 +1093,20 @@ class Bridge:
                 _log.debug("session write failed", exc_info=True)
         self._emit_tool_stats("turn")
         emit({"type": "turn_end", "reply": reply})
+
+    def _record_turn_cost(self, usage: Any) -> None:
+        """Fold one turn's final usage into the session cost; show dollars
+        only when the model has a known price (otherwise stay silent —
+        ``/usage`` then reports tokens only)."""
+        model = self._adapter.model_name() if self._adapter is not None else self._model
+        turn = self._cost.add_turn(model, usage)
+        if turn is not None:
+            emit(
+                {
+                    "type": "info",
+                    "message": f"cost: ${turn:.4f} this turn · ${self._cost.usd:.4f} session",
+                }
+            )
 
     # ── permission decisions ─────────────────────────────────────────
 
