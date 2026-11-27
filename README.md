@@ -99,7 +99,19 @@ koda --model ollama:llama3.1               # local Ollama
 koda -c                                    # resume your most recent session
 koda --cwd ~/work/my-project               # target a project without cd-ing in
 koda --prompt "Fix the pagination bug"     # one-shot mode (no UI, scriptable)
+koda -y -p "Summarize this repo" --output-format json         # one JSON result object
+koda -y -p "Summarize this repo" --output-format stream-json  # one event per line, ends with a result event
+koda -y -p "Refactor utils" --max-turns 5                     # stop after 5 model turns (exit 3)
+koda -y -p "Refactor utils" --max-budget-usd 0.50             # stop at $0.50 (exit 3)
 ```
+
+One-shot runs exit `0` on success, `1` on an agent error, `2` on bad arguments and
+`3` when a limit is reached. Add `-y` / `--auto-approve` for unattended runs, or gated
+tool calls wait for approval. A "turn" is one model step (the first output, and the
+first output after each batch of tool results). `json` / `stream-json` keep stdout to
+JSON only; `cost_usd` appears only when `KODA_INPUT_PRICE_PER_MTOK` and
+`KODA_OUTPUT_PRICE_PER_MTOK` are set, and `--max-budget-usd` can only trigger then
+(otherwise it warns on stderr).
 
 ---
 

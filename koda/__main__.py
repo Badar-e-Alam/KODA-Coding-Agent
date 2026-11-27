@@ -212,7 +212,40 @@ def main() -> None:
         dest="no_tui",
         help="Alias for --prompt (one-shot, non-interactive)",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=["text", "json", "stream-json"],
+        default="text",
+        dest="output_format",
+        help=(
+            "One-shot output: text (default), json (one result object at the "
+            "end) or stream-json (one event per line, ending with a result "
+            "event)."
+        ),
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        metavar="N",
+        help="One-shot: stop after N model turns (exit code 3).",
+    )
+    parser.add_argument(
+        "--max-budget-usd",
+        type=float,
+        default=None,
+        metavar="X",
+        help=(
+            "One-shot: stop once cost reaches X USD (exit code 3). Needs "
+            "KODA_INPUT_PRICE_PER_MTOK and KODA_OUTPUT_PRICE_PER_MTOK."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.max_turns is not None and args.max_turns < 1:
+        parser.error("--max-turns must be a positive integer")
+    if args.max_budget_usd is not None and not args.max_budget_usd > 0:
+        parser.error("--max-budget-usd must be greater than 0")
 
     # --no-tui is an alias for --prompt (backward compat with eval harness)
     prompt = args.prompt
@@ -221,6 +254,16 @@ def main() -> None:
     elif args.no_tui and prompt is not None and prompt != "__stdin__":
         # --prompt was already set, leave it alone
         pass
+
+    if prompt is None and (
+        args.output_format != "text"
+        or args.max_turns is not None
+        or args.max_budget_usd is not None
+    ):
+        parser.error(
+            "--output-format, --max-turns and --max-budget-usd need one-shot "
+            "mode (--prompt)"
+        )
 
     if args.cwd is not None:
         from pathlib import Path as _Path
@@ -265,73 +308,218 @@ def main() -> None:
 
     import asyncio
     try:
-        # One-shot mode: stream text to stdout, no interactive UI.
-        asyncio.run(_run_oneshot(
+        # One-shot mode: no interactive UI.
+        code = asyncio.run(_run_oneshot(
             factory=factory,
             model=model,
             prompt=prompt,
             auto_approve=args.auto_approve,
+            output_format=args.output_format,
+            max_turns=args.max_turns,
+            max_budget_usd=args.max_budget_usd,
         ))
     except KeyboardInterrupt:
         sys.exit(130)
+    sys.exit(code)
 
 
-async def _run_oneshot(*, factory, model: str, prompt: str, auto_approve: bool = False) -> None:
-    """Run one prompt, stream text to stdout, then exit.
+EXIT_OK = 0
+EXIT_AGENT_ERROR = 1
+EXIT_BAD_ARGS = 2
+EXIT_LIMIT = 3
 
-    Reads the prompt from stdin if ``--prompt`` was given without a value,
-    or from the first positional arg / ``sys.stdin`` when piped.
+
+def _token_prices() -> tuple[float, float] | None:
+    """USD per million (input, output) tokens from the environment, if set.
+
+    KODA has no built-in price table, so cost is only known when the caller
+    supplies ``KODA_INPUT_PRICE_PER_MTOK`` and ``KODA_OUTPUT_PRICE_PER_MTOK``.
     """
-    import time
-    from koda.agent_api import Done, TextDelta, ToolStart
+    try:
+        return (
+            float(os.environ["KODA_INPUT_PRICE_PER_MTOK"]),
+            float(os.environ["KODA_OUTPUT_PRICE_PER_MTOK"]),
+        )
+    except (KeyError, ValueError):
+        return None
 
-    # Resolve prompt text
+
+async def _run_oneshot(
+    *,
+    factory,
+    model: str,
+    prompt: str,
+    auto_approve: bool = False,
+    output_format: str = "text",
+    max_turns: int | None = None,
+    max_budget_usd: float | None = None,
+) -> int:
+    """Run one prompt non-interactively and return the process exit code.
+
+    ``output_format``: ``text`` (default, streams text to stdout), ``json``
+    (one result object at the end) or ``stream-json`` (one bridge-style event
+    per line, ending with a ``result`` event). In the JSON formats stdout holds
+    only JSON; progress goes to stderr.
+
+    A "turn" is one model step: the first assistant output, and the first
+    output after each batch of tool results. ``max_turns`` stops the run when a
+    new turn would exceed the limit. ``max_budget_usd`` needs a known cost
+    (see :func:`_token_prices`); otherwise it warns on stderr and cannot trigger.
+    Limits are checked between events, so a run can overshoot slightly.
+
+    Exit codes: 0 success, 1 agent error, 3 limit reached.
+    """
+    import json
+    import time
+    from koda.agent_api import (
+        Done, TextDelta, ThinkingDelta, ToolResult, ToolStart, Usage,
+    )
+
+    text_mode = output_format == "text"
+    stream_json = output_format == "stream-json"
+
+    def emit(obj: dict) -> None:
+        print(json.dumps(obj, default=str), flush=True)
+
     if prompt == "__stdin__":
         prompt_text = sys.stdin.read()
     else:
         prompt_text = prompt
 
-    # Build adapter (same path as the TUI)
-    adapter = factory(model=model, thread_id=f"oneshot-{os.getpid()}")
+    thread_id = f"oneshot-{os.getpid()}"
+    prices = _token_prices()
+    if max_budget_usd is not None and prices is None:
+        print(
+            "warning: --max-budget-usd cannot be enforced: cost is unknown "
+            "(set KODA_INPUT_PRICE_PER_MTOK and KODA_OUTPUT_PRICE_PER_MTOK)",
+            file=sys.stderr, flush=True,
+        )
 
-    if auto_approve:
-        # Allow all gated tool calls so the agent can run unattended.
-        try:
-            from koda.tools import permissions as _perms  # type: ignore[attr-defined]
-            _perms.set_auto_approve(True)  # type: ignore[union-attr]
-        except Exception:
-            pass  # The module doesn't have this function — the eval runner
-            # will just wait on permission prompts until timeout. That's
-            # harmless but should be rare; the eval harness doesn't use this.
-
-    stream_start = time.monotonic()
+    texts: list[str] = []
+    turns = 0
+    tool_calls = 0
+    in_tok = out_tok = 0
+    usage_events = False
+    need_new_turn = True
+    limit_reason: str | None = None
+    error_msg: str | None = None
     event_count = 0
+    stream_start = time.monotonic()
+
+    def cost() -> float | None:
+        if prices is None:
+            return None
+        return (in_tok * prices[0] + out_tok * prices[1]) / 1_000_000
+
+    adapter = None
     try:
+        # Build adapter (same path as the TUI)
+        adapter = factory(model=model, thread_id=thread_id)
+
+        if auto_approve:
+            # Allow all gated tool calls so the agent can run unattended.
+            try:
+                from koda.tools import permissions as _perms  # type: ignore[attr-defined]
+                _perms.set_auto_approve(True)  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+        if stream_json:
+            from koda.bridge import _event_to_json
+
         async for event in adapter.stream(prompt_text, []):
             event_count += 1
+            if isinstance(event, (TextDelta, ThinkingDelta, ToolStart)) and need_new_turn:
+                if max_turns is not None and turns >= max_turns:
+                    limit_reason = "max_turns"
+                    break
+                turns += 1
+                need_new_turn = False
+            elif isinstance(event, ToolResult):
+                need_new_turn = True
+
+            if stream_json:
+                obj = _event_to_json(event)
+                if obj is not None:
+                    emit(obj)
+
             if isinstance(event, TextDelta):
-                print(event.content, end="", flush=True)
+                texts.append(event.content)
+                if text_mode:
+                    print(event.content, end="", flush=True)
             elif isinstance(event, ToolStart):
+                tool_calls += 1
                 # One tool dot per call on stderr so users know what is happening
                 print(".", end="", file=sys.stderr, flush=True)
+            elif isinstance(event, Usage):
+                usage_events = True
+                in_tok += event.input_tokens
+                out_tok += event.output_tokens
             elif isinstance(event, Done) and event.usage:
-                # Print a compact footer on stderr so stdout stays clean
                 u = event.usage
+                if not usage_events:
+                    in_tok += u.input_tokens
+                    out_tok += u.output_tokens
                 used = []
                 if u.input_tokens:
                     used.append(f"in={u.input_tokens}")
                 if u.output_tokens:
                     used.append(f"out={u.output_tokens}")
+                # Compact footer on stderr so stdout stays clean
                 print(
                     f"\n[{event_count} events  {' '.join(used)}]",
                     file=sys.stderr, flush=True,
                 )
+
+            c = cost()
+            if max_budget_usd is not None and c is not None and c >= max_budget_usd:
+                limit_reason = "max_budget_usd"
+                break
+    except Exception as exc:  # agent/adapter failure
+        error_msg = f"{type(exc).__name__}: {exc}"
+        if stream_json:
+            emit({"type": "error", "message": error_msg})
+        print(f"\nerror: {error_msg}", file=sys.stderr, flush=True)
     finally:
         # Clean up the aiosqlite checkpointer (non-daemon worker thread)
-        if hasattr(adapter, "aclose"):
-            await adapter.aclose()
+        if adapter is not None and hasattr(adapter, "aclose"):
+            try:
+                await adapter.aclose()
+            except Exception:
+                pass
+
+    # Limits take precedence over errors.
+    if limit_reason:
+        code = EXIT_LIMIT
+    elif error_msg:
+        code = EXIT_AGENT_ERROR
+    else:
+        code = EXIT_OK
+
     elapsed = time.monotonic() - stream_start
+    if not text_mode:
+        result: dict = {
+            "result": "".join(texts),
+            "session_id": thread_id,
+            "turns": turns,
+            "tool_calls": tool_calls,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "is_error": code != EXIT_OK,
+        }
+        c = cost()
+        if c is not None:
+            result["cost_usd"] = c
+        if limit_reason:
+            result["reason"] = limit_reason
+        elif error_msg:
+            result["reason"] = "error"
+            result["error"] = error_msg
+        if stream_json:
+            result = {"type": "result", **result}
+        emit(result)
     print(f"\n[{elapsed:.1f}s] done", file=sys.stderr, flush=True)
+    return code
 
 
 def _run_ink(
