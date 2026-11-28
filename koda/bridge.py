@@ -511,7 +511,11 @@ class Bridge:
         # Background-subagent registry, bound to this loop so the agent's
         # start_async_task/… tools (which run on worker threads) can drive it.
         self._registry = BackgroundTaskRegistry(
-            factory=self._factory, model=self._model, on_update=self._on_task_update
+            factory=self._factory,
+            model=self._model,
+            on_update=self._on_task_update,
+            cwd=Path.cwd(),
+            on_notice=lambda message: emit({"type": "info", "message": message}),
         )
         try:
             from koda import subagent_tools
@@ -661,6 +665,7 @@ class Bridge:
             self._pending_task_notes.append(
                 f"<task-notification>Background {task.subagent_type} task {task.id} "
                 f"{st}. Brief: {task.description[:80]}. {body} "
+                f"{task.summary.diff_summary}\n"
                 f"Use check_async_task('{task.id}') for the full output.</task-notification>"
             )
 

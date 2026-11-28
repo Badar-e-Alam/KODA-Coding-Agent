@@ -108,6 +108,8 @@ def _build_chat_model(model: str):
 
 
 def _build_system_prompt(workspace: Path) -> str:
+    from koda.subagent_worktrees import task_cwd
+
     now = datetime.now()
     utc = datetime.now(timezone.utc)
     return _SYSTEM_PROMPT_TEMPLATE.format(
@@ -115,7 +117,7 @@ def _build_system_prompt(workspace: Path) -> str:
         datetime_utc=utc.strftime("%Y-%m-%d %H:%M:%S"),
         os_info=f"{platform.system()} {platform.release()}",
         python_version=platform.python_version(),
-        cwd=os.getcwd(),
+        cwd=task_cwd.get() or os.getcwd(),
         workspace=workspace,
     )
 
@@ -139,7 +141,10 @@ def build_deep_graph(
     ws = Path(workspace) if workspace else Path(os.environ.get(
         "KODA_WORKSPACE", Path.cwd() / "agent_workspace"
     ))
-    set_workspace_root(ws)
+    from koda.subagent_worktrees import task_cwd
+
+    if task_cwd.get() is None:
+        set_workspace_root(ws)
 
     chat_model = _build_chat_model(model)
     return create_react_agent(

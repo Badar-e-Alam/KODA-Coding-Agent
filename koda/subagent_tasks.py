@@ -32,8 +32,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from koda.agent_api import (
     PermissionRequest,
@@ -42,6 +45,7 @@ from koda.agent_api import (
     ToolStart,
     Usage,
 )
+from koda.subagent_worktrees import TaskWorktree, cleanup_worktrees, repository_root
 
 _log = logging.getLogger("koda.subagent_tasks")
 
@@ -93,6 +97,9 @@ class TaskSummary:
     awaiting_permission: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
+    worktree_path: str | None = None
+    branch: str | None = None
+    diff_summary: str = ""
 
     def to_json(self) -> dict[str, Any]:
         elapsed = (self.updated_at or self.started_at) - self.started_at if self.started_at else 0.0
@@ -109,6 +116,9 @@ class TaskSummary:
             "awaiting_permission": self.awaiting_permission,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "worktree_path": self.worktree_path,
+            "branch": self.branch,
+            "diff_summary": self.diff_summary,
         }
 
 
@@ -130,6 +140,8 @@ class BackgroundTask:
     # Last emitted change-key — lets _emit drop no-op updates (token streaming
     # would otherwise fire an identical task_update per delta).
     _last_emit_key: tuple | None = None
+    workspace: TaskWorktree | None = None
+    _run_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 # Callback the registry fires whenever a task's summary changes, and again with
@@ -160,13 +172,27 @@ class BackgroundTaskRegistry:
         model: str,
         on_update: UpdateCb | None = None,
         clock: Callable[[], float] = time.monotonic,
+        cwd: Path | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> None:
         self._factory = factory
         self._model = model
         self._on_update = on_update
         self._clock = clock
         self._tasks: dict[str, BackgroundTask] = {}
-        self._counter = 0
+        self._root = repository_root(cwd) if cwd is not None else None
+        self._on_notice = on_notice
+        self._cleanup_timer: asyncio.TimerHandle | None = None
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._root is not None:
+            cleanup_worktrees(self._root)
+            self._cleanup_timer = asyncio.get_running_loop().call_later(60, self._cleanup)
+
+    def _make_adapter(self, task: BackgroundTask) -> Any:
+        options = {"cwd": task.workspace.path} if task.workspace is not None else {}
+        return self._factory(model=self._model, thread_id=f"{task.id}-{uuid4().hex}", **options)
 
     # ── introspection ────────────────────────────────────────────────
 
@@ -187,10 +213,14 @@ class BackgroundTaskRegistry:
 
     def spawn(self, description: str, subagent_type: str = "general-purpose") -> str:
         """Create a task and start it running in the background. Returns its id."""
-        self._counter += 1
-        task_id = f"task_{self._counter}"
-        thread_id = f"{task_id}-{int(self._clock() * 1000)}"
-        adapter = self._factory(model=self._model, thread_id=thread_id)
+        task_id = f"task_{uuid4().hex}"
+        workspace = None
+        if subagent_type not in ("explore", "plan"):
+            if self._root is not None:
+                workspace = TaskWorktree(self._root, task_id)
+            elif self._on_notice is not None:
+                self._on_notice("Git worktree isolation is unavailable here. Background tasks use the current directory.")
+                self._on_notice = None
         summary = TaskSummary(
             id=task_id,
             description=description,
@@ -199,13 +229,16 @@ class BackgroundTaskRegistry:
             started_at=self._clock(),
             updated_at=self._clock(),
             current="starting…",
+            worktree_path=str(workspace.path) if workspace else None,
+            branch=workspace.branch if workspace else None,
         )
         task = BackgroundTask(
             id=task_id,
             description=description,
             subagent_type=subagent_type,
-            adapter=adapter,
+            adapter=None,
             summary=summary,
+            workspace=workspace,
         )
         self._tasks[task_id] = task
         preamble = ROLE_PREAMBLES.get(subagent_type, ROLE_PREAMBLES["general-purpose"])
@@ -234,16 +267,6 @@ class BackgroundTaskRegistry:
         prev = task._task
         if prev is not None and not prev.done():
             prev.cancel()
-
-            async def _restart_after_cancel() -> None:
-                try:
-                    await asyncio.wait_for(asyncio.shield(prev), timeout=5)
-                except Exception:
-                    pass
-                await self._run(task, message)
-
-            task._task = asyncio.ensure_future(_restart_after_cancel())
-            return True
         task._task = asyncio.ensure_future(self._run(task, message))
         return True
 
@@ -254,9 +277,16 @@ class BackgroundTaskRegistry:
             return False
         if task._task is not None and not task._task.done():
             task._task.cancel()
+        preamble = ROLE_PREAMBLES.get(task.subagent_type, ROLE_PREAMBLES["general-purpose"])
+        task._task = asyncio.ensure_future(self._run(task, preamble + task.description, restart=True))
+        return True
+
+    async def _reset(self, task: BackgroundTask) -> None:
         # New adapter → new thread_id → no memory of the previous run.
-        thread_id = f"{task_id}-{int(self._clock() * 1000)}"
-        task.adapter = self._factory(model=self._model, thread_id=thread_id)
+        aclose = getattr(task.adapter, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        task.adapter = None
         task.final_text = ""
         task.tool_log.clear()
         task.activity.clear()
@@ -266,9 +296,6 @@ class BackgroundTaskRegistry:
         task.summary.output_tokens = 0
         task.summary.started_at = self._clock()
         task.summary.error = ""
-        preamble = ROLE_PREAMBLES.get(task.subagent_type, ROLE_PREAMBLES["general-purpose"])
-        task._task = asyncio.ensure_future(self._run(task, preamble + task.description))
-        return True
 
     def answer_permission(self, task_id: str, outcomes: list[str]) -> bool:
         """Answer a background task's gated tool call (approve/always/deny)."""
@@ -302,6 +329,8 @@ class BackgroundTaskRegistry:
 
     async def aclose(self) -> None:
         """Cancel every task and close its adapter."""
+        if self._cleanup_timer is not None:
+            self._cleanup_timer.cancel()
         for task in list(self._tasks.values()):
             if task._task is not None and not task._task.done():
                 task._task.cancel()
@@ -309,7 +338,7 @@ class BackgroundTaskRegistry:
             if task._task is not None:
                 try:
                     await asyncio.wait_for(asyncio.shield(task._task), timeout=2)
-                except Exception:
+                except (asyncio.CancelledError, Exception):
                     pass
             aclose = getattr(task.adapter, "aclose", None)
             if aclose is not None:
@@ -320,11 +349,28 @@ class BackgroundTaskRegistry:
 
     # ── the run loop ─────────────────────────────────────────────────
 
-    async def _run(self, task: BackgroundTask, message: str) -> None:
+    async def _run(self, task: BackgroundTask, message: str, restart: bool = False) -> None:
+        async with task._run_lock:
+            with ExitStack() as stack:
+                await self._run_in_workspace(task, message, restart, stack)
+
+    async def _run_in_workspace(
+        self, task: BackgroundTask, message: str, restart: bool, stack: ExitStack
+    ) -> None:
         task.summary.state = "running"
         task.summary.current = "thinking…"
-        await self._emit(task)
+        task.summary.diff_summary = ""
+        task.summary.error = ""
+        task.summary.awaiting_permission = False
+        task._pending_perm = None
         try:
+            if task.workspace is not None:
+                stack.enter_context(task.workspace.activate())
+            if restart:
+                await self._reset(task)
+            if task.adapter is None:
+                task.adapter = self._make_adapter(task)
+            await self._emit(task)
             async for ev in task.adapter.stream(message, []):
                 if isinstance(ev, ToolStart):
                     task.summary.tool_count += 1
@@ -356,6 +402,8 @@ class BackgroundTaskRegistry:
                 await self._emit(task)
             # A stream only ends after any pause was resolved and the graph ran
             # to completion, so a normal end is always success.
+            if task.workspace is not None:
+                task.summary.diff_summary = task.workspace.finish()
             task.summary.state = "success"
             task.summary.current = "done"
         except asyncio.CancelledError:
