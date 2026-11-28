@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from coding_agent.agent import build_agent
@@ -43,11 +44,14 @@ class CodingAgentAdapter(LangGraphAdapter):
 
     _backend = "coding-agent"
 
-    def __init__(self, model: str, thread_id: str | None = None) -> None:
+    def __init__(
+        self, model: str, thread_id: str | None = None, cwd: Path | None = None
+    ) -> None:
         # Initialise the LangGraph adapter with ``graph=None``; the
         # parent's introspection helpers tolerate that and report an
         # empty tool list until the graph is built.
         super().__init__(graph=None, model=model, thread_id=thread_id)
+        self._cwd = cwd
         # Concurrent first-streams could race on graph construction
         # (unlikely in the TUI, possible in eval harnesses) — guard with
         # a lock so only one ``build_agent`` call lands.
@@ -61,7 +65,7 @@ class CodingAgentAdapter(LangGraphAdapter):
             if self._graph is not None:
                 return
             _log.debug("building coding_agent graph for model=%s", self._model)
-            self._graph = await build_agent(model=self._model)
+            self._graph = await build_agent(model=self._model, cwd=self._cwd)
 
     async def _use_model(self, model: str) -> None:
         """Rebuild the graph on the new model; same thread_id keeps history."""
@@ -134,9 +138,10 @@ class CodingAgentAdapter(LangGraphAdapter):
 def create_coding_agent_adapter(
     model: str = "anthropic:claude-sonnet-4-6",
     thread_id: str | None = None,
+    cwd: Path | None = None,
 ) -> CodingAgentAdapter:
     """Build the coding-agent adapter. Used by ``koda --agent coding_agent``."""
-    return CodingAgentAdapter(model=model, thread_id=thread_id)
+    return CodingAgentAdapter(model=model, thread_id=thread_id, cwd=cwd)
 
 
 __all__ = ["CodingAgentAdapter", "create_coding_agent_adapter"]

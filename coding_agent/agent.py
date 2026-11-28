@@ -212,7 +212,9 @@ async def build_agent(
 
     root = Path(cwd) if cwd else Path.cwd()
     backend = build_backend(root, timeout=timeout, inherit_env=inherit_env)
-    checkpointer = _build_checkpointer(root)
+    from koda.subagent_worktrees import task_project_root
+
+    checkpointer = _build_checkpointer(task_project_root.get() or root)
     resolved_model = resolve_model(model)
 
     # Context management (see coding_agent/compaction.py):

@@ -141,6 +141,8 @@ def check_async_task(task_id: str) -> str:
     s = task.summary
     status = _wire_status(s.state)
     out: dict[str, Any] = {"status": status, "task_id": s.id}
+    if s.branch is not None:
+        out.update(branch=s.branch, worktree_path=s.worktree_path, diff_summary=s.diff_summary)
     if s.state == "success":
         out["result"] = task.final_text or "(completed with no output messages)"
     elif s.state == "error":

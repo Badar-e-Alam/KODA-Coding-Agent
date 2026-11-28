@@ -97,7 +97,7 @@ def multi_edit(path: str, edits: list[FindReplace]) -> str:
         path: target file.
         edits: list of {"old": str, "new": str} entries, applied in order.
     """
-    p = Path(path)
+    p = _local_path(path)
     if not p.exists():
         return f"[error] file not found: {path}"
     text = p.read_text()
@@ -295,7 +295,7 @@ def visual_analyze(
         The model's text analysis of the image. Errors are prefixed
         with ``[error]``.
     """
-    img = Path(image_path)
+    img = _local_path(image_path)
     if not img.exists():
         return f"[error] image not found: {image_path}"
     if img.suffix.lower() not in _SUPPORTED_IMAGE_EXTENSIONS:
@@ -378,11 +378,23 @@ def visual_analyze(
 # ── git tools ──────────────────────────────────────────────────────────
 
 
+def _local_path(path: str) -> Path:
+    from koda.subagent_worktrees import task_cwd
+
+    root = task_cwd.get()
+    if root is None:
+        return Path(path)
+    resolved = (root / path).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"Path is outside the task worktree: {path!r}")
+    return resolved
+
+
 def _git(args: list[str], cwd: str = ".") -> str:
     try:
         r = subprocess.run(
             ["git", *args],
-            cwd=cwd,
+            cwd=_local_path(cwd),
             capture_output=True,
             text=True,
             timeout=15,
@@ -541,7 +553,7 @@ def run_tests(framework: str = "auto", extra_args: str = "", path: str = ".") ->
     ``TypeError: run_tests() got an unexpected keyword argument
     'v__args'`` at invocation time. Keep it as ``extra_args``.
     """
-    root = Path(path)
+    root = _local_path(path)
     fw = framework if framework != "auto" else _detect_test_framework(root)
     if not fw:
         return "[error] could not auto-detect a test framework; pass framework= explicitly"
@@ -647,7 +659,7 @@ def run_type_check(checker: str = "auto", extra_args: str = "", path: str = ".")
         the tail (~4 KB) of stdout/stderr. The tail keeps failure detail
         in context without ballooning prompt size.
     """
-    root = Path(path)
+    root = _local_path(path)
     ck = checker if checker != "auto" else _detect_type_checker(root)
     if not ck:
         return "[error] could not auto-detect a type checker; pass checker= explicitly"
@@ -749,7 +761,7 @@ def run_lint(linter: str = "auto", extra_args: str = "", path: str = ".") -> str
         ``linter=<name> exit=<code>`` followed by a summary and the tail
         (~4 KB) of stdout/stderr.
     """
-    root = Path(path)
+    root = _local_path(path)
     ln = linter if linter != "auto" else _detect_linter(root)
     if not ln:
         return "[error] could not auto-detect a linter; pass linter= explicitly"
@@ -933,7 +945,7 @@ def bash_background(command: str, path: str = ".") -> str:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered so readline() yields promptly
-            cwd=path,
+            cwd=_local_path(path),
             env=_enriched_env(),
             start_new_session=True,
         )

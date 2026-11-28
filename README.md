@@ -144,6 +144,14 @@ to watch each one: a stable status line (what it's doing, tokens, tools, elapsed
 seconds) over a **scrollable activity log** of every step it took. `←` opens an
 agent, `→` closes, `↑/↓` scroll.
 
+In a Git project, local background editing tasks start from the current commit
+in `.koda/worktrees/<task-id>`. On success, KODA saves their edits to
+`koda/<task-id>` and reports the branch and changed files for you or the main
+agent to merge. KODA sweeps inactive worktrees after their branches become
+ancestors of the project HEAD or after seven days of inactivity, and keeps the
+branches available. Read-only tasks use the current workspace. Outside Git,
+KODA uses the current workspace and shows a one-time notice.
+
 ```mermaid
 sequenceDiagram
     actor U as You

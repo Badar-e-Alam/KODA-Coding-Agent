@@ -19,6 +19,7 @@ from pathlib import Path
 
 from langchain.tools import tool
 
+from koda.subagent_worktrees import task_cwd
 from koda.tools.permissions import check as _permission_check
 
 # ── Workspace root ─────────────────────────────────────────────────────
@@ -56,9 +57,10 @@ def _resolve(p: str) -> Path:
     the path convention. Stripping the root prefix makes both spellings work;
     paths genuinely outside the root are still rejected below.
     """
+    root = task_cwd.get() or _ROOT
     raw = p.replace("\\", "/")
     if raw.startswith("/"):
-        root_str = str(_ROOT)
+        root_str = str(root)
         if raw == root_str:
             raw = ""
         elif raw.startswith(root_str + "/"):
@@ -67,7 +69,7 @@ def _resolve(p: str) -> Path:
             raw = raw.lstrip("/")
     else:
         raw = p
-    candidate = _ROOT / raw
+    candidate = root / raw
     # Reject symlinks along the path — resolve() would follow them out of the jail.
     probe = candidate
     while True:
@@ -79,12 +81,12 @@ def _resolve(p: str) -> Path:
         if not probe.exists():
             continue
         try:
-            probe.relative_to(_ROOT)
+            probe.relative_to(root)
         except ValueError:
             break
     full = candidate.resolve()
     try:
-        full.relative_to(_ROOT)
+        full.relative_to(root)
     except ValueError as e:
         raise ValueError(f"Path escapes workspace root: {p!r}") from e
     return full
@@ -93,7 +95,7 @@ def _resolve(p: str) -> Path:
 def _rel(p: Path) -> str:
     """Format a real path as a model-visible absolute path."""
     try:
-        return "/" + str(p.relative_to(_ROOT)).replace(os.sep, "/")
+        return "/" + str(p.relative_to(task_cwd.get() or _ROOT)).replace(os.sep, "/")
     except ValueError:
         return str(p)
 
@@ -271,7 +273,7 @@ def grep(
         glob: Filename pattern to filter (e.g. '*.py').
         output_mode: 'files_with_matches' | 'content' | 'count'.
     """
-    base = _resolve(path) if path else _ROOT
+    base = _resolve(path or "/")
     if not base.exists():
         return f"Error: path not found: {path}"
 
@@ -322,7 +324,7 @@ def execute(command: str, timeout: int | None = 120) -> str:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=str(_ROOT),
+            cwd=str(task_cwd.get() or _ROOT),
             capture_output=True,
             text=True,
             timeout=timeout if timeout and timeout > 0 else None,

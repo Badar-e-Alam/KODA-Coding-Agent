@@ -80,14 +80,14 @@ def _build_adapter_factory(spec: str):
     """
     if spec == "deep":
         from koda.adapters.deep import create_deep_adapter
-        return lambda model, thread_id: create_deep_adapter(
-            model=model, thread_id=thread_id
+        return lambda model, thread_id, cwd=None: create_deep_adapter(
+            model=model, thread_id=thread_id, workspace=cwd
         )
 
     if spec == "coding_agent":
         from koda.adapters.coding_agent import create_coding_agent_adapter
-        return lambda model, thread_id: create_coding_agent_adapter(
-            model=model, thread_id=thread_id
+        return lambda model, thread_id, cwd=None: create_coding_agent_adapter(
+            model=model, thread_id=thread_id, cwd=cwd
         )
 
     if "." in spec:
