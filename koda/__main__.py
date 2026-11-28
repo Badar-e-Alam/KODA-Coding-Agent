@@ -372,7 +372,7 @@ async def _run_oneshot(
     import json
     import time
     from koda.agent_api import (
-        Done, TextDelta, ThinkingDelta, ToolResult, ToolStart, Usage,
+        Done, Notice, TextDelta, ThinkingDelta, ToolResult, ToolStart, Usage,
     )
 
     text_mode = output_format == "text"
@@ -451,6 +451,8 @@ async def _run_oneshot(
                 tool_calls += 1
                 # One tool dot per call on stderr so users know what is happening
                 print(".", end="", file=sys.stderr, flush=True)
+            elif isinstance(event, Notice) and not stream_json:
+                print(event.message, file=sys.stderr, flush=True)
             elif isinstance(event, Usage):
                 usage_events = True
                 in_tok += event.input_tokens

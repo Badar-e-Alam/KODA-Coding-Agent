@@ -21,6 +21,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from coding_agent.backend import build_backend
+from coding_agent.hooks import load_hooks
 from coding_agent.compaction import (
     build_context_editing_middleware,
     build_manual_compaction_engine,
@@ -224,6 +225,9 @@ async def build_agent(
     #     command (see ``CodingAgentAdapter.compact``); it's stashed on the
     #     graph below rather than added to the chain.
     extra_middleware = []
+    hooks = load_hooks(root, backend.default)
+    if hooks is not None:
+        extra_middleware.append(hooks)
     context_editing = build_context_editing_middleware()
     if context_editing is not None:
         extra_middleware.append(context_editing)
@@ -320,6 +324,7 @@ async def build_agent(
     graph._koda_compact_engine = build_manual_compaction_engine(  # type: ignore[attr-defined]
         resolved_model, backend
     )
+    graph._koda_hooks = hooks  # type: ignore[attr-defined]
     return graph
 
 

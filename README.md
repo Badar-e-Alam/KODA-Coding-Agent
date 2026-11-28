@@ -241,6 +241,41 @@ Copy `.env.example` → `.env` and set the keys for your provider(s):
 
 `KODA_DEFAULT_MODEL` pins a default so you don't pass `--model` every launch.
 
+### Project hooks
+
+The default coding agent reads hooks from `.koda/settings.json` when it builds
+the agent. Each hook has a case-sensitive shell glob `matcher`, a shell
+`command`, and an optional positive `timeout` in seconds (default 30).
+Matching hooks run in the order listed.
+
+```json
+{
+  "hooks": {
+    "pre_tool": [
+      {"matcher": "execute", "command": "./scripts/check-command"}
+    ],
+    "post_tool": [
+      {"matcher": "edit_file", "command": "./scripts/format-edited-file", "timeout": 10}
+    ],
+    "stop": [
+      {"matcher": "*", "command": "echo 'KODA turn finished'"}
+    ]
+  }
+}
+```
+
+The commands run from the project directory with the same environment inheritance
+as `execute`. Only enable hooks from projects you trust to run shell commands.
+Tool hooks match the tool name and receive a JSON object on stdin with `event`,
+`tool_name`, and `tool_input` (the tool arguments). Stop hooks match the literal
+name `stop` and receive `{"event":"stop"}` after the agent finishes the turn.
+
+A `pre_tool` hook that exits with code 2 blocks the tool call and shows its
+stderr to the agent. `post_tool` appends stdout and stderr to the tool result.
+Stop hook output appears as a notice. Other nonzero exits and timeouts are
+reported and the turn continues. Hook text added to a tool result or stop notice
+is capped at 4,096 characters.
+
 ---
 
 ## Contributing
