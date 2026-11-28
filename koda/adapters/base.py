@@ -137,6 +137,10 @@ class BaseAdapter(KodaAgent):
             return False
         return True
 
+    async def _finish_turn(self) -> str:
+        """Return a notice to surface before the final Done, if any."""
+        return ""
+
     async def stream(
         self, message: str, history: list[dict[str, Any]]
     ) -> AsyncIterator[AgentEvent]:
@@ -218,6 +222,9 @@ class BaseAdapter(KodaAgent):
                 )
                 break
 
+        notice = await self._finish_turn()
+        if notice:
+            yield Notice(message=notice)
         yield Done(usage=Usage(**usage.__dict__) if _has_usage(usage) else None)
 
     async def _stream_attempt(

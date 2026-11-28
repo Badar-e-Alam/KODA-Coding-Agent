@@ -44,7 +44,7 @@ from deepagents.backends import (
     FilesystemBackend,
     LocalShellBackend,
 )
-from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
+from deepagents.backends.protocol import ExecuteResponse
 
 # Skills ship with the package so the agent always has them available,
 # regardless of which project directory it was launched in.
@@ -83,18 +83,7 @@ class ReapingShellBackend(LocalShellBackend):
             raise ValueError(msg)
 
         try:
-            proc = subprocess.Popen(  # noqa: S602
-                command,
-                shell=True,  # Intentional: LLM-controlled shell execution.
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=self._env,
-                cwd=str(self.cwd),
-                # New session → the shell and everything it spawns share a
-                # process group we can signal as a unit.
-                start_new_session=True,
-            )
+            proc = self._start_command(command)
         except Exception as e:  # noqa: BLE001
             return ExecuteResponse(
                 output=f"Error executing command ({type(e).__name__}): {e}",
@@ -149,21 +138,35 @@ class ReapingShellBackend(LocalShellBackend):
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
-        """SIGTERM then SIGKILL the process group led by ``proc``."""
+        """Kill the group even if the shell already exited before its children."""
         try:
-            pgid = os.getpgid(proc.pid)
+            os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
-            return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+            pass
+        proc.wait()
+
+    def _start_command(self, command: str, *, stdin=None, errors: str | None = None) -> subprocess.Popen[str]:
+        return subprocess.Popen(  # noqa: S602
+            command,
+            shell=True,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors=errors,
+            env=self._env,
+            cwd=str(self.cwd),
+            start_new_session=True,
+        )
+
+    def run_hook(self, command: str, payload: str, timeout: float) -> tuple[int, str, str]:
+        with self._start_command(command, stdin=subprocess.PIPE, errors="replace") as proc:
             try:
-                os.killpg(pgid, sig)
-            except ProcessLookupError:
-                return
-            try:
-                proc.wait(timeout=3)
-                return
-            except subprocess.TimeoutExpired:
-                continue
+                stdout, stderr = proc.communicate(payload, timeout=timeout)
+            except (subprocess.TimeoutExpired, OSError, UnicodeError):
+                self._kill_group(proc)
+                raise
+            return proc.returncode, stdout, stderr
 
 
 def project_memories_dir(root: Path) -> Path:
@@ -176,7 +179,7 @@ def build_backend(
     *,
     timeout: int = 180,
     inherit_env: bool = True,
-) -> BackendProtocol:
+) -> CompositeBackend:
     """Construct the composite backend for the coding agent.
 
     Args:

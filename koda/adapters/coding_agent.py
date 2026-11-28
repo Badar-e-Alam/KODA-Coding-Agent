@@ -63,6 +63,10 @@ class CodingAgentAdapter(LangGraphAdapter):
             _log.debug("building coding_agent graph for model=%s", self._model)
             self._graph = await build_agent(model=self._model)
 
+    async def _finish_turn(self) -> str:
+        hooks = getattr(self._graph, "_koda_hooks", None)
+        return await hooks.stop() if hooks is not None else ""
+
     async def _use_model(self, model: str) -> None:
         """Rebuild the graph on the new model; same thread_id keeps history."""
         async with self._graph_build_lock:
